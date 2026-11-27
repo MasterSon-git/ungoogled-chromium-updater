@@ -9,6 +9,8 @@ Run the same static checks and Windows suites used by CI in PowerShell 7.5 or ne
 git diff --check
 ```
 
+With [GitHub CLI](https://cli.github.com/) on `PATH`, use `Test-Project.ps1 -ReleaseCli` to include the publication regression. Windows CI and the unsigned release build run it by default. The test checks multiline notes from an isolated annotated tag and runs the real CLI with a missing notes file so it stops after argument validation and before HTTP.
+
 The suite uses controlled data and a private temporary directory. It includes legacy release evidence checks and an installer fixture that exits successfully with a payload mismatch. The launcher must retain recovery, keep the previous release record, and block browser launch in that case. Use `Update.ps1 -CheckOnly -VerifyCurrent` for a read-only check against the installed browser and live sources. Document which network and runtime paths you exercised.
 
 The self-update suite uses a temporary signing key, actual release ZIPs, an isolated Setup installation, and the compiled Windows launcher. It supplies fixture responses at the network boundary and launches a small argument recorder. It tests a changed launcher and bootstrap, an added manifest file used by the installed maintenance command, and verified manual recovery after a hard interruption between the app directory renames. Record the actual GitHub CI result separately from local validation. See [release procedures](docs/releases.md) for the signing approval gate and live staging validation.
