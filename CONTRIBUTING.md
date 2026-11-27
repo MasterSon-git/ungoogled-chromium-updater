@@ -19,4 +19,4 @@ By submitting original code, scripts, tooling, or documentation, you agree to li
 
 Before adding third-party code or assets, verify their source and applicable terms. Preserve the applicable copyright and license text, and record the source, affected files, and applicable terms in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-Before committing, check the exact staged files and scan for local paths, credentials, profile information, log output and extension inventories. Add new project files to the path allowlist in `.gitignore` after reviewing them. Keep any environment-specific assessment in private local storage. Follow [publication review](docs/publication.md) before sharing the repository or a source archive.
+Before committing, check the exact staged files and scan for local paths, credentials, profile information, log output and extension inventories. Keep any environment-specific assessment in private local storage. Select and review distribution package contents explicitly.
