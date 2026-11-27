@@ -36,7 +36,7 @@ function Publish-FixtureFeed([string]$Package, $Release) {
     Write-Json (Join-Path $feed 'releases.json') @($Release)
 }
 
-function Start-FixtureLauncher {
+function Start-FixtureLauncher([string]$ExpectedUpdaterStatus = 'Current') {
     $workerPidFile = Join-Path $feed 'worker.pid'
     [IO.File]::Delete($state)
     [IO.File]::Delete($argumentsFile)
@@ -62,6 +62,7 @@ function Start-FixtureLauncher {
         Assert-Equal $received.arguments.Count $arguments.Count
         for ($i = 0; $i -lt $arguments.Count; $i++) { Assert-Equal $received.arguments[$i] $arguments[$i] }
         Assert-Equal (Read-DailyState $state).Status 'Complete'
+        Assert-Equal (Read-DailyState $state).UpdaterStatus $ExpectedUpdaterStatus
         $workerProcess = try { [Diagnostics.Process]::GetProcessById([int][IO.File]::ReadAllText($workerPidFile)) }
         catch [ArgumentException] { $null }
         if ($workerProcess) {
@@ -132,14 +133,24 @@ function Invoke-TrustedGet {
     else { ,([IO.File]::ReadAllBytes($file)) }
 }
 '@
-    $common = [IO.File]::ReadAllText($commonFile).Replace('    $temp = "$Path.', @'
-    if ([IO.Path]::GetFileName($Path) -ceq 'updater-active.json' -and
-        [IO.File]::Exists((Join-Path ([IO.Path]::GetDirectoryName($Path)) 'fixture-feed/interrupt'))) {
-        [Environment]::Exit(88)
-    }
-    $temp = "$Path.
+    $handoffFile = Join-Path $src 'Handoff.ps1'
+    $handoff = [IO.File]::ReadAllText($handoffFile)
+    $interruptedHandoff = $handoff.Replace('        Remove-UpdaterDirectory $Root ''updater-previous-app''', @'
+        if ([IO.File]::Exists((Join-Path $Root 'fixture-feed/interrupt'))) {
+            [IO.File]::WriteAllText((Join-Path $Root 'fixture-feed/interrupted'), "$PID")
+            [Environment]::Exit(88)
+        }
+        Remove-UpdaterDirectory $Root 'updater-previous-app'
 '@)
-    [IO.File]::WriteAllText($commonFile, $common)
+    $bootstrapFile = Join-Path $src 'Update.ps1'
+    $bootstrap = [IO.File]::ReadAllText($bootstrapFile).Replace("[void](Read-Host 'Press Enter to close this window')", 'Start-Sleep -Milliseconds 1500')
+    [IO.File]::WriteAllText($bootstrapFile, $bootstrap)
+    $launcherFile = Join-Path $src 'Launcher.cs'
+    $launcher = [IO.File]::ReadAllText($launcherFile)
+    $setupFile = Join-Path $src 'Setup.ps1'
+    $setup = [IO.File]::ReadAllText($setupFile)
+    $selfUpdateFile = Join-Path $src 'SelfUpdate.ps1'
+    $selfUpdate = [IO.File]::ReadAllText($selfUpdateFile)
     $workerFile = Join-Path $src 'Worker.ps1'
     $worker = [IO.File]::ReadAllText($workerFile).Replace(
         '    $installed = Get-BrowserVersion', @'
@@ -152,21 +163,52 @@ function Invoke-TrustedGet {
 
     $packages = @{}
     $releases = @{}
+    $files = Get-UpdaterPackageFiles
     foreach ($version in '0.2.0-rc.2','0.2.0','0.2.1','0.3.0') {
         [IO.File]::WriteAllText($versionFile, $version)
+        if ($version -eq '0.2.0') {
+            [IO.File]::WriteAllText($launcherFile, $launcher.Replace(
+                '            string command =', @'
+            File.WriteAllText(Path.Combine(Environment.CurrentDirectory, "new-launcher.txt"), "new launcher");
+            string command =
+'@))
+            [IO.File]::WriteAllText($bootstrapFile, $bootstrap.Replace('try { $code = Invoke-Launcher }', @'
+if ($SelfUpdateOutcome -ceq 'Applied') {
+    [IO.File]::WriteAllText((Join-Path ([Environment]::CurrentDirectory) 'new-bootstrap.txt'), 'new bootstrap')
+}
+try { $code = Invoke-Launcher }
+'@))
+            [IO.File]::WriteAllText((Join-Path $src 'Maintenance.txt'), 'upgraded maintenance')
+            $files['Maintenance.txt'] = 'src/Maintenance.txt'
+            [IO.File]::WriteAllText($selfUpdateFile, $selfUpdate.Replace(
+                'function Get-UpdaterPackageFiles { Get-UpdaterCoreFiles }', @'
+function Get-UpdaterPackageFiles {
+    $files = Get-UpdaterCoreFiles
+    $files['Maintenance.txt'] = 'src/Maintenance.txt'
+    $files
+}
+'@))
+            [IO.File]::WriteAllText($setupFile, $setup.Replace('        if ($TestInstall -eq [guid]::Empty) { Set-LauncherShortcuts $root $true }', @'
+        [IO.File]::Copy((Join-Path $PSScriptRoot 'Maintenance.txt'), (Join-Path $root 'maintenance-result.txt'))
+        if ($TestInstall -eq [guid]::Empty) { Set-LauncherShortcuts $root $true }
+'@))
+        }
+        if ($version -eq '0.2.1') { [IO.File]::WriteAllText($handoffFile, $interruptedHandoff) }
         if ($version -eq '0.3.0') {
             [IO.File]::WriteAllText($workerFile, $worker.Replace('exit 42', 'exit 1'))
         }
         $dir = Join-Path $work $version
         [void][IO.Directory]::CreateDirectory($dir)
         $zip = Join-Path $dir $script:UpdaterPackageName
-        New-UpdaterPackage $source $zip
+        New-UpdaterPackage $source $zip $files
         if ($version -eq '0.2.0') {
             $second = Join-Path $work 'reproducible.zip'
-            New-UpdaterPackage $source $second
+            New-UpdaterPackage $source $second $files
             Assert-Equal (Get-FileHash -LiteralPath $zip).Hash (Get-FileHash -LiteralPath $second).Hash
         }
-        Write-UpdaterSignature $zip $version $signer
+        $env:UPDATER_SIGNING_KEY = [Convert]::ToBase64String($signer.ExportPkcs8PrivateKey())
+        Write-EnvironmentUpdaterSignature $zip $version $script:UpdaterReleasePublicKey
+        Assert-Equal $env:UPDATER_SIGNING_KEY $null
         $packages[$version] = $zip
         $releases[$version] = New-FixtureRelease $version $zip
     }
@@ -208,17 +250,30 @@ function Invoke-TrustedGet {
         [void]$archive.CreateEntry('../Update.ps1')
     } finally { $archive.Dispose() }
     Assert-Fails { Expand-UpdaterPackage $malformed (Join-Path $work 'escape') '0.2.0' } 'Unsafe'
+    $unlisted = Join-Path $work 'unlisted.zip'
+    Copy-Item -LiteralPath $zip -Destination $unlisted
+    $archive = [IO.Compression.ZipFile]::Open($unlisted, 'Update')
+    try {
+        $entryStream = $archive.CreateEntry('Unlisted.ps1').Open()
+        try { $entryStream.WriteByte(35) } finally { $entryStream.Dispose() }
+    } finally { $archive.Dispose() }
+    Assert-Fails { Expand-UpdaterPackage $unlisted (Join-Path $work 'unlisted') '0.2.0' } 'Invalid updater package manifest'
     Assert-Fails { Expand-UpdaterPackage $zip (Join-Path $work 'wrong-version') '0.2.1' } 'version does not match'
     Write-Output 'PASS SemVer, release identity, reproducible ZIP, signature, tampering and unsafe contents'
 
     [IO.File]::WriteAllText($versionFile, $base.Text)
     [IO.File]::WriteAllText($workerFile, $worker)
+    [IO.File]::WriteAllText($handoffFile, $handoff)
+    [IO.File]::WriteAllText($launcherFile, $launcher)
+    [IO.File]::WriteAllText($bootstrapFile, $bootstrap)
+    [IO.File]::WriteAllText($setupFile, $setup)
+    [IO.File]::WriteAllText($selfUpdateFile, $selfUpdate)
     & (Join-Path $src 'Setup.ps1') -Install -TestInstall $id
     Assert-PrivateRoot $root
     $feed = Join-Path $root 'fixture-feed'
     $state = Join-Path $root 'state.json'
     $configPath = Join-Path $root 'config.json'
-    $activePath = Join-Path $root 'updater-active.json'
+    $activePath = Join-Path $root 'app/updater-slot.json'
     $argumentsFile = Join-Path $feed 'arguments.json'
     $requestLog = Join-Path $feed 'requests.txt'
     $arguments = @('https://example.test/?a=1&b=2','quote"inside','dir with space\','', "utf-$([char]0x00e9)")
@@ -283,7 +338,7 @@ internal static class Recorder {
     $config.updaterChannel = 'Staging'
     Write-Json $configPath $config
     $configBefore = (Get-FileHash -LiteralPath $configPath).Hash
-    Start-FixtureLauncher
+    Start-FixtureLauncher 'Applied'
     Assert-Equal (Read-Json $activePath).Version '0.2.0-rc.2'
     Assert-Equal (Get-FileHash -LiteralPath $configPath).Hash $configBefore
     Assert-Equal ([IO.File]::ReadAllLines($requestLog).Count) 1
@@ -295,15 +350,20 @@ internal static class Recorder {
     Publish-FixtureFeed $zip $stable
     $config.selfUpdateEnabled = $false
     Write-Json $configPath $config
-    Start-FixtureLauncher
+    Start-FixtureLauncher 'Skipped'
     Assert-Equal ([IO.File]::Exists($requestLog)) $false
     Assert-Equal (Read-Json $activePath).Version '0.2.0-rc.2'
     $config.selfUpdateEnabled = $true
     $config.updaterChannel = 'Stable'
     Write-Json $configPath $config
     $configBefore = (Get-FileHash -LiteralPath $configPath).Hash
-    Start-FixtureLauncher
+    $launcherTarget = Join-Path $root 'app/ChromiumUpdater.exe'
+    $launcherHash = (Get-FileHash -LiteralPath $launcherTarget).Hash
+    Start-FixtureLauncher 'Applied'
     Assert-Equal (Read-Json $activePath).Version '0.2.0'
+    Assert-Equal (Get-Content -LiteralPath (Join-Path $feed 'new-bootstrap.txt') -Raw) 'new bootstrap'
+    Assert-Equal (Get-Content -LiteralPath (Join-Path $root 'app/Maintenance.txt') -Raw) 'upgraded maintenance'
+    Assert-Equal (Get-FileHash -LiteralPath (Join-Path $root 'updater-previous-app/ChromiumUpdater.exe')).Hash $launcherHash
     Assert-Equal (Get-UpdaterVersion (Join-Path $root 'updater-a/Updater.version')).Text '0.2.0-rc.2'
     Assert-Equal (Get-FileHash -LiteralPath $configPath).Hash $configBefore
     Write-Output 'PASS Windows EXE launcher across Stable, Staging, disabled and subsequent stable releases with exact launch arguments'
@@ -314,18 +374,23 @@ internal static class Recorder {
     Publish-FixtureFeed $packages['0.2.1'] $releases['0.2.1']
     [IO.File]::WriteAllText($interrupt, 'interrupt')
     [IO.File]::Delete($argumentsFile)
-    & ([Environment]::ProcessPath) -NoProfile -NonInteractive -File $update -Force
-    Assert-Equal $LASTEXITCODE 88
+    & ([Environment]::ProcessPath) -NoProfile -File $update -Force -Interactive
+    Assert-Equal $LASTEXITCODE 20
+    $deadline = [DateTime]::UtcNow.AddSeconds(30)
+    $interrupted = Join-Path $feed 'interrupted'
+    while (![IO.File]::Exists($interrupted) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
+    if (![IO.File]::Exists($interrupted)) { throw 'The interrupted handoff did not reach the expected fault.' }
     Assert-Equal ([IO.File]::Exists($argumentsFile)) $false
     Assert-Equal (Read-Json $activePath).Version '0.2.0'
     Assert-Equal (Get-UpdaterVersion (Join-Path $root 'updater-a/Updater.version')).Text '0.2.1'
     Assert-Equal ([IO.Directory]::Exists((Join-Path $root 'updater-work'))) $true
     [IO.File]::Delete($interrupt)
     [IO.File]::Delete((Join-Path $feed 'releases.json'))
-    Start-FixtureLauncher
+    Start-FixtureLauncher 'Failed'
+    Assert-Equal (Get-Content -LiteralPath (Join-Path $feed 'new-launcher.txt') -Raw) 'new launcher'
     Assert-Equal (Read-Json $activePath).Version '0.2.0'
     Publish-FixtureFeed $packages['0.3.0'] $releases['0.3.0']
-    Start-FixtureLauncher
+    Start-FixtureLauncher 'Failed'
     Assert-Equal (Read-Json $activePath).Version '0.2.0'
     Assert-Equal ([IO.Directory]::Exists((Join-Path $root 'updater-work'))) $false
     Assert-Equal (Get-UpdaterVersion (Join-Path $root 'updater-a/Updater.version')).Text '0.2.1'
@@ -356,6 +421,12 @@ internal static class Recorder {
     Publish-FixtureFeed $zip $stable
     Start-FixtureLauncher
     Assert-Equal (Get-UpdaterSlot $root).Slot 'app'
+    [IO.File]::WriteAllText((Join-Path $root 'app/ReleaseTrust.ps1'), '$script:UpdaterReleasePublicKey = ""')
+    Start-FixtureLauncher 'Unavailable'
+    Assert-Equal ([IO.File]::Exists($requestLog)) $false
+    & (Join-Path $root 'app/Setup.ps1') -Uninstall -TestInstall $id
+    Assert-Equal (Get-Content -LiteralPath (Join-Path $root 'maintenance-result.txt') -Raw) 'upgraded maintenance'
+    Assert-Equal ([IO.Directory]::Exists((Join-Path $root 'app'))) $false
     Write-Output 'PASS failed network, interrupted staging, failed worker probe, concurrent dispatch, browser recovery and verified manual reinstall'
 } finally {
     $signer.Dispose()

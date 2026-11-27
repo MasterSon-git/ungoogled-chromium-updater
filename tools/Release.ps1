@@ -3,7 +3,6 @@
 param(
     [Parameter(ParameterSetName = 'Build')][ValidatePattern('\A[0-9a-f]{40}\z')][string]$Commit,
     [Parameter(ParameterSetName = 'Build')][string]$OutputDirectory,
-    [Parameter(ParameterSetName = 'Build')][ValidatePattern('\A[0-9a-fA-F]{40}\z')][string]$CertificateThumbprint,
     [Parameter(Mandatory, ParameterSetName = 'Verify')][string]$VerifyPackage,
     [Parameter(Mandatory, ParameterSetName = 'Verify')][string]$Version
 )
@@ -12,18 +11,20 @@ param(
 . (Join-Path $PSScriptRoot '../src/Browser.ps1')
 . (Join-Path $PSScriptRoot '../src/SelfUpdate.ps1')
 
-function New-UpdaterPackage([string]$Source, [string]$Path) {
+function New-UpdaterPackage([string]$Source, [string]$Path, $Files = (Get-UpdaterPackageFiles)) {
     Assert-LocalPath $Path
     $stream = [IO.File]::Open($Path, 'CreateNew', 'ReadWrite', 'None')
     try {
         $archive = [IO.Compression.ZipArchive]::new($stream, 'Create', $true)
         try {
-            $files = Get-UpdaterPackageFiles
-            foreach ($name in $files.Keys) {
+            foreach ($name in @($Files.Keys) + 'updater-files.json') {
                 $entry = $archive.CreateEntry($name, 'NoCompression')
                 $entry.LastWriteTime = [DateTimeOffset]::new(2000, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
                 $entry.ExternalAttributes = 0
-                $inputStream = [IO.File]::OpenRead((Join-Path $Source $files[$name]))
+                $inputStream = if ($name -ceq 'updater-files.json') {
+                    $manifest = ConvertTo-Json -Compress ([ordered]@{ Schema = 1; Files = @($Files.Keys) })
+                    [IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes($manifest))
+                } else { [IO.File]::OpenRead((Join-Path $Source $Files[$name])) }
                 try {
                     $output = $entry.Open()
                     try { $inputStream.CopyTo($output) }
@@ -35,12 +36,12 @@ function New-UpdaterPackage([string]$Source, [string]$Path) {
     } finally { $stream.Dispose() }
 }
 
-function Write-UpdaterSignature([string]$Path, [string]$Version, [Security.Cryptography.RSA]$Signer) {
+function Write-UpdaterSignature([string]$Path, [string]$Version, [Security.Cryptography.RSA]$Signer, [string]$PublicKey = $script:UpdaterReleasePublicKey) {
     $size = (Get-Item -LiteralPath $Path).Length
     $digest = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
     $signature = $Signer.SignData((Get-UpdaterSignatureInput "v$Version" $size $digest),
         [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pkcs1)
-    Assert-UpdaterSignature "v$Version" $size $digest $signature
+    Assert-UpdaterSignature "v$Version" $size $digest $signature $PublicKey
     Assert-LocalPath "$Path.sig"
     $file = [IO.File]::Open("$Path.sig", 'CreateNew', 'Write', 'None')
     try {
@@ -49,7 +50,28 @@ function Write-UpdaterSignature([string]$Path, [string]$Version, [Security.Crypt
     } finally { $file.Dispose() }
 }
 
-function Test-UpdaterReleasePackage([string]$Path, [string]$Version, [string]$Destination) {
+function Write-EnvironmentUpdaterSignature([string]$Path, [string]$Version, [string]$PublicKey) {
+    $encoded = $env:UPDATER_SIGNING_KEY
+    $env:UPDATER_SIGNING_KEY = $null
+    $signer = [Security.Cryptography.RSA]::Create()
+    $keyBytes = $null
+    try {
+        if (!$encoded) { throw 'The protected signing secret is missing.' }
+        $keyBytes = [Convert]::FromBase64String($encoded)
+        $encoded = $null
+        $read = 0
+        $signer.ImportPkcs8PrivateKey($keyBytes, [ref]$read)
+        if ($read -ne $keyBytes.Length) { throw 'Unexpected PKCS#8 data.' }
+        Write-UpdaterSignature $Path $Version $signer $PublicKey
+    } catch {
+        throw 'Release signing failed. Verify the environment key format and its approved public pin.'
+    } finally {
+        if ($keyBytes) { [Array]::Clear($keyBytes) }
+        $signer.Dispose()
+    }
+}
+
+function Test-UpdaterReleasePackage([string]$Path, [string]$Version, [string]$Destination, [string]$PublicKey = $script:UpdaterReleasePublicKey) {
     Assert-LocalPath $Path
     Assert-LocalPath "$Path.sig"
     $size = (Get-Item -LiteralPath $Path).Length
@@ -58,7 +80,7 @@ function Test-UpdaterReleasePackage([string]$Path, [string]$Version, [string]$De
         throw 'Unexpected release package or signature size.'
     }
     $digest = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
-    Assert-UpdaterSignature "v$Version" $size $digest ([IO.File]::ReadAllBytes("$Path.sig"))
+    Assert-UpdaterSignature "v$Version" $size $digest ([IO.File]::ReadAllBytes("$Path.sig")) $PublicKey
     Expand-UpdaterPackage $Path $Destination $Version
 }
 
@@ -97,13 +119,7 @@ try {
     New-UpdaterPackage $source $package
     Expand-UpdaterPackage $package $expanded $release.Text
     Assert-UpdaterWorker $expanded
-    if ($CertificateThumbprint) {
-        $certificate = Get-Item -LiteralPath "Cert:\CurrentUser\My\$CertificateThumbprint"
-        $signer = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($certificate)
-        if (!$signer) { throw 'The release-signing certificate must have an accessible RSA private key.' }
-        try { Write-UpdaterSignature $package $release.Text $signer }
-        finally { $signer.Dispose() }
-    }
+    Build-UpdaterLauncher $expanded ([Environment]::ProcessPath)
     Write-Output "Updater v$($release.Text) from commit $Commit"
     Get-FileHash -LiteralPath $package -Algorithm SHA256 | Select-Object Algorithm, Hash
 } finally {

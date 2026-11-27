@@ -1,0 +1,100 @@
+name: Updater release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+concurrency:
+  group: updater-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'MasterSon-git/ungoogled-chromium-updater' && github.event.created && !github.event.deleted && !github.event.forced
+    name: Test and build unsigned package
+    runs-on: windows-2025
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      hash: ${{ steps.build.outputs.hash }}
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Test selected tag and build twice
+        id: build
+        shell: pwsh
+        run: ./tools/Actions-Release.ps1 -Phase Build
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        id: upload
+        with:
+          name: unsigned-${{ github.run_attempt }}
+          path: release-out/unsigned/ungoogled-chromium-updater-v1.zip
+          if-no-files-found: error
+
+  sign:
+    name: Sign approved release
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    environment: release-signing
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: release-out/unsigned
+          merge-multiple: true
+      - name: Verify artifact hash and sign
+        shell: pwsh
+        env:
+          EXPECTED_PACKAGE_HASH: ${{ needs.build.outputs.hash }}
+          UPDATER_SIGNING_KEY: ${{ secrets.UPDATER_SIGNING_KEY }}
+        run: ./tools/Actions-Release.ps1 -Phase Sign
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        id: upload
+        with:
+          name: signature-${{ github.run_attempt }}
+          path: release-out/signed/ungoogled-chromium-updater-v1.zip.sig
+          if-no-files-found: error
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+
+  publish:
+    name: Publish immutable GitHub release
+    needs: [build, sign]
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          path: release-out/unsigned
+          merge-multiple: true
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          artifact-ids: ${{ needs.sign.outputs.artifact-id }}
+          path: release-out/signed
+          merge-multiple: true
+      - name: Verify and publish exact signed assets
+        shell: pwsh
+        env:
+          EXPECTED_PACKAGE_HASH: ${{ needs.build.outputs.hash }}
+          GH_TOKEN: ${{ github.token }}
+        run: ./tools/Actions-Release.ps1 -Phase Publish

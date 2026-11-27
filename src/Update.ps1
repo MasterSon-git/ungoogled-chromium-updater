@@ -2,7 +2,8 @@
 [CmdletBinding()]
 param(
     [switch]$Force, [switch]$CheckOnly, [switch]$Stage, [switch]$Apply, [switch]$NoLaunch,
-    [switch]$VerifyCurrent, [switch]$TestCompatibility, [switch]$Dispatch, [switch]$Interactive,
+    [switch]$VerifyCurrent, [switch]$TestCompatibility, [switch]$Dispatch, [switch]$Interactive, [switch]$Probe,
+    [ValidateSet('Applied','Failed')][string]$SelfUpdateOutcome,
     [string]$Payload,
     [string[]]$BrowserArguments = @()
 )
@@ -50,6 +51,10 @@ if ($MyInvocation.InvocationName -eq '.') {
     . (Join-Path $PSScriptRoot 'Worker.ps1')
     return
 }
+if ($Probe) {
+    & (Join-Path $PSScriptRoot 'Worker.ps1') -Probe
+    exit $LASTEXITCODE
+}
 try { $code = Invoke-Launcher }
 catch {
     if ($Dispatch) { exit 10 }
@@ -57,6 +62,7 @@ catch {
     $code = 1
 }
 if ($Interactive) {
+    if ($code -eq 20) { exit $code }
     if ($code) { [void](Read-Host 'Press Enter to close this window') }
     else { Start-Sleep -Milliseconds 1500 }
 }

@@ -24,9 +24,9 @@ Add a verified Chrome Web Store extension's exact ID to `extensions` with the va
 
 ### Updater releases
 
-The updater checks this project's GitHub Releases on its normal eligible launch. `selfUpdateEnabled` defaults to `true`. `updaterChannel` defaults to `"Stable"`, which accepts stable updater releases. Set it to `"Staging"` to also receive updater prereleases. The updater only installs a higher version, so switching back to Stable may mean waiting for a newer stable release. Chromium and extension channels keep their stable release policies.
+The updater checks this project's GitHub Releases on eligible launches through a shortcut or `app\ChromiumUpdater.exe`. `selfUpdateEnabled` defaults to `true`. `updaterChannel` defaults to `"Stable"`, which accepts stable updater releases. Set it to `"Staging"` to also receive updater prereleases. The updater only installs a higher version, so switching back to Stable may mean waiting for a newer stable release. Self-update replaces the launcher, bootstrap, worker and maintenance code at the existing shortcut target. Chromium and extension channels keep their stable release policies.
 
-Automatic updater releases require a maintainer-approved signing key in the installed updater and a publicly accessible release feed. Set `"selfUpdateEnabled": false` to pause updater self-updates. See [manual installation and recovery](docs/maintenance.md#updater-maintenance-and-recovery) for upgrades from an older installation, verification, and repair.
+Automatic updater releases require a maintainer-approved public signing pin in the installed updater and a publicly accessible release feed. A failed, deferred or unavailable updater check is reported separately from the browser and extension checks. Set `"selfUpdateEnabled": false` to pause updater self-updates. See [manual installation and recovery](docs/maintenance.md#updater-maintenance-and-recovery) for upgrades from an older installation, verification, and repair.
 
 ## Launch and check
 
@@ -50,7 +50,7 @@ Pass browser arguments directly to `app\ChromiumUpdater.exe` for a quiet shortcu
 
 Setup backs up the original Desktop and Start Menu shortcuts before changing their targets. Existing arguments, icons, and working directories are preserved. Pinned Chromium, direct `chrome.exe` launches, default HTTP/HTTPS handlers and file associations can bypass the updater. The taskbar can use a separately pinned launcher where Windows offers that action. The native Chromium taskbar pin continues to identify Chromium itself.
 
-Run `.\src\Setup.ps1 -Uninstall` from the checkout, or run the installed `app\Setup.ps1 -Uninstall`. Setup restores the backed-up shortcuts and removes the launcher files. If a shortcut was edited after integration, use the corresponding copy in `shortcut-backups` to restore it manually. Remove any separate updater pin in Windows. The private runtime directory retains configuration, logs and recovery data.
+Run `app\Setup.ps1 -Uninstall` to use the installed version's maintenance code. You can also use `.\src\Setup.ps1 -Uninstall` from a current trusted checkout. Setup restores the backed-up shortcuts and removes the launcher files. If a shortcut was edited after integration, use the corresponding copy in `shortcut-backups` to restore it manually. Remove any separate updater pin in Windows. The private runtime directory retains configuration, logs and recovery data.
 
 See [browser maintenance and recovery](docs/maintenance.md), [extension maintenance](docs/extensions.md), [security](SECURITY.md), and [development](CONTRIBUTING.md).
 

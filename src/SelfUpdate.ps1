@@ -4,7 +4,7 @@ $script:UpdaterRepository = 'MasterSon-git/ungoogled-chromium-updater'
 $script:UpdaterPackageName = 'ungoogled-chromium-updater-v1.zip'
 $script:UpdaterPackageLimit = 512KB
 
-function Get-UpdaterPackageFiles {
+function Get-UpdaterCoreFiles {
     [ordered]@{
         'Browser.ps1' = 'src/Browser.ps1'
         'BrowserPayload.ps1' = 'src/BrowserPayload.ps1'
@@ -12,6 +12,7 @@ function Get-UpdaterPackageFiles {
         'config.example.json' = 'config.example.json'
         'Crx3.cs' = 'src/Crx3.cs'
         'Extensions.ps1' = 'src/Extensions.ps1'
+        'Handoff.ps1' = 'src/Handoff.ps1'
         'Launcher.cs' = 'src/Launcher.cs'
         'LICENSE' = 'LICENSE'
         'Mv2.ps1' = 'src/Mv2.ps1'
@@ -23,6 +24,15 @@ function Get-UpdaterPackageFiles {
         'Updater.version' = 'src/Updater.version'
         'Worker.ps1' = 'src/Worker.ps1'
     }
+}
+
+function Get-UpdaterPackageFiles { Get-UpdaterCoreFiles }
+
+function Test-UpdaterPayloadName([string]$Name) {
+    $Name -cmatch '\A[A-Za-z][A-Za-z0-9._-]{0,63}\z' -and
+        $Name -notmatch '\A(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|\z)' -and
+        $Name -notin 'updater-slot.json','config.json' -and
+        ($Name -cin (Get-UpdaterCoreFiles).Keys -or $Name -cmatch '\.(?:ps1|cs|json|md|txt)\z')
 }
 
 function Convert-UpdaterVersion([string]$Text) {
@@ -101,13 +111,13 @@ function Get-UpdaterSignatureInput([string]$Tag, [long]$Size, [string]$Digest) {
     ,([Text.Encoding]::ASCII.GetBytes("Ungoogled Chromium Updater package v1`n$script:UpdaterRepository`n$Tag`n$length`n$($Digest.ToLowerInvariant())`n"))
 }
 
-function New-UpdaterVerificationKey {
+function New-UpdaterVerificationKey([string]$PublicKey = $script:UpdaterReleasePublicKey) {
     $rsa = [Security.Cryptography.RSA]::Create()
     try {
-        if ($script:UpdaterReleasePublicKey.Trim() -cnotmatch '\A-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+\n-----END PUBLIC KEY-----\z') {
+        if ($PublicKey.Trim() -cnotmatch '\A-----BEGIN PUBLIC KEY-----\r?\n[A-Za-z0-9+/=\r\n]+\n-----END PUBLIC KEY-----\z') {
             throw 'Invalid updater release public key pin.'
         }
-        $rsa.ImportFromPem($script:UpdaterReleasePublicKey)
+        $rsa.ImportFromPem($PublicKey)
         if ($rsa.KeySize -notin 3072,4096) { throw 'Unsupported updater release key size.' }
         $rsa
     } catch {
@@ -116,8 +126,8 @@ function New-UpdaterVerificationKey {
     }
 }
 
-function Assert-UpdaterSignature([string]$Tag, [long]$Size, [string]$Digest, [byte[]]$Signature) {
-    $rsa = New-UpdaterVerificationKey
+function Assert-UpdaterSignature([string]$Tag, [long]$Size, [string]$Digest, [byte[]]$Signature, [string]$PublicKey = $script:UpdaterReleasePublicKey) {
+    $rsa = New-UpdaterVerificationKey $PublicKey
     try {
         if ($Signature.Length -ne $rsa.KeySize / 8 -or
             !$rsa.VerifyData((Get-UpdaterSignatureInput $Tag $Size $Digest), $Signature,
@@ -128,7 +138,7 @@ function Assert-UpdaterSignature([string]$Tag, [long]$Size, [string]$Digest, [by
 }
 
 function Expand-UpdaterPackage([string]$Path, [string]$Destination, [string]$Version) {
-    $files = (Get-UpdaterPackageFiles).Keys
+    $manifestName = 'updater-files.json'
     Assert-LocalPath $Path
     Assert-LocalPath $Destination
     if ((Get-Item -LiteralPath $Path).Length -gt $script:UpdaterPackageLimit -or
@@ -138,19 +148,27 @@ function Expand-UpdaterPackage([string]$Path, [string]$Destination, [string]$Ver
     $archive = [IO.Compression.ZipFile]::OpenRead($Path)
     $deadline = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds(10))
     try {
-        if ($archive.Entries.Count -ne $files.Count) { throw 'Unexpected updater package file count.' }
-        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+        if ($archive.Entries.Count -gt 48) { throw 'Unexpected updater package file count.' }
+        $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $total = 0L
         foreach ($entry in $archive.Entries) {
             $deadline.Token.ThrowIfCancellationRequested()
             $type = ($entry.ExternalAttributes -shr 16) -band 0xF000
-            if ($entry.FullName -cnotin $files -or !$seen.Add($entry.FullName) -or
+            if (!(Test-UpdaterPayloadName $entry.FullName) -or !$seen.Add($entry.FullName) -or
                 $type -notin 0,0x8000 -or ($entry.ExternalAttributes -band 0x410) -or
                 $entry.Length -le 0 -or $entry.Length -gt 256KB) {
                 throw 'Unsafe or unexpected updater package entry.'
             }
+            [void]$names.Add($entry.FullName)
             $total += $entry.Length
             if ($total -gt 1MB) { throw 'Updater package exceeds the extraction size limit.' }
+        }
+        if (!$names.Contains($manifestName) -or $archive.GetEntry($manifestName).Length -gt 8KB) {
+            throw 'Missing or oversized updater package manifest.'
+        }
+        foreach ($required in (Get-UpdaterCoreFiles).Keys) {
+            if (!$names.Contains($required)) { throw 'Missing required updater package file.' }
         }
         [void][IO.Directory]::CreateDirectory($Destination)
         $buffer = [byte[]]::new(16384)
@@ -172,6 +190,15 @@ function Expand-UpdaterPackage([string]$Path, [string]$Destination, [string]$Ver
             } finally { $inputStream.Dispose() }
         }
         $deadline.Token.ThrowIfCancellationRequested()
+        [void]$names.Remove($manifestName)
+        $manifest = Read-Json (Join-Path $Destination $manifestName)
+        if ($manifest -isnot [Collections.IDictionary] -or $manifest.Count -ne 2 -or $manifest['Schema'] -ne 1 -or
+            $manifest['Files'] -isnot [array] -or $manifest['Files'].Count -ne $names.Count) {
+            throw 'Invalid updater package manifest.'
+        }
+        foreach ($name in $manifest['Files']) {
+            if ($name -isnot [string] -or !$names.Remove($name)) { throw 'Unexpected updater package manifest file.' }
+        }
         if ((Get-UpdaterVersion (Join-Path $Destination 'Updater.version')).Text -cne $Version) {
             throw 'Updater package version does not match its release tag.'
         }
@@ -193,7 +220,7 @@ function Assert-UpdaterWorker([string]$Directory, [string]$Shell = [Environment]
     $start.RedirectStandardOutput = $true
     $start.RedirectStandardError = $true
     $start.WorkingDirectory = $Directory
-    foreach ($argument in '-NoLogo','-NoProfile','-NonInteractive','-File',(Join-Path $Directory 'Worker.ps1'),'-Probe') {
+    foreach ($argument in '-NoLogo','-NoProfile','-NonInteractive','-File',(Join-Path $Directory 'Update.ps1'),'-Probe') {
         [void]$start.ArgumentList.Add($argument)
     }
     $process = [Diagnostics.Process]::Start($start)
@@ -206,7 +233,18 @@ function Assert-UpdaterWorker([string]$Directory, [string]$Shell = [Environment]
     } finally { $process.Dispose() }
 }
 
-function Remove-UpdaterDirectory([string]$Root, [ValidateSet('updater-work','updater-a','updater-b')][string]$Name) {
+function Build-UpdaterLauncher([string]$Directory, [string]$Shell) {
+    $compiler = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+    if (![IO.File]::Exists($compiler)) {
+        $compiler = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+    }
+    $launcher = Join-Path $Directory 'ChromiumUpdater.exe'
+    & $compiler '/nologo' '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Web.Extensions.dll' "/out:$launcher" (Join-Path $Directory 'Launcher.cs') | Out-Null
+    if ($LASTEXITCODE -ne 0 -or ![IO.File]::Exists($launcher)) { throw 'Windows launcher compilation failed.' }
+    [IO.File]::WriteAllText((Join-Path $Directory 'pwsh.path'), $Shell)
+}
+
+function Remove-UpdaterDirectory([string]$Root, [ValidateSet('updater-work','updater-a','updater-b','updater-previous-app')][string]$Name) {
     $path = Join-Path $Root $Name
     if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($path)) -ine [IO.Path]::GetFullPath($Root)) {
         throw 'Unexpected updater directory.'
@@ -217,18 +255,43 @@ function Remove-UpdaterDirectory([string]$Root, [ValidateSet('updater-work','upd
     Remove-Item -LiteralPath $path -Recurse -Force
 }
 
-function Install-UpdaterCandidate([string]$Root, [string]$Directory, [string]$Channel) {
-    if (!$script:UpdaterReleasePublicKey) { return }
+function Get-UpdaterProcess([int]$ProcessId, [long]$StartTicks) {
+    $process = $null
+    try {
+        $process = [Diagnostics.Process]::GetProcessById($ProcessId)
+        if (!$process.HasExited -and $process.StartTime.ToUniversalTime().Ticks -eq $StartTicks) { return $process }
+    } catch [ArgumentException], [InvalidOperationException], [ComponentModel.Win32Exception] { }
+    if ($process) { $process.Dispose() }
+}
+
+function Test-PendingUpdaterHandoff([string]$Root) {
+    $path = Join-Path $Root 'updater-work/handoff.json'
+    Assert-LocalPath $path
+    if (![IO.File]::Exists($path) -or (Get-Item -LiteralPath $path).Length -gt 4096) { return $false }
+    $helper = try {
+        $pending = Read-Json $path
+        Get-UpdaterProcess $pending.ProcessId $pending.StartTicks
+    } catch { $null }
+    if (!$helper) { return $false }
+    $helper.Dispose()
+    $true
+}
+
+function Install-UpdaterCandidate([string]$Root, [string]$Directory, [string]$Channel, $Resume) {
+    if (!$script:UpdaterReleasePublicKey) { return 'Unavailable' }
     $active = Get-UpdaterSlot $Root
     if ($active.Directory -ine $Directory) { throw 'Updater activation changed unexpectedly.' }
     $installed = Get-UpdaterVersion (Join-Path $Directory 'Updater.version')
+    $work = Join-Path $Root 'updater-work'
+    $planPath = Join-Path $work 'handoff.json'
+    if (Test-PendingUpdaterHandoff $Root) { return 'Deferred' }
     $releases = Get-RemoteJson "https://api.github.com/repos/$script:UpdaterRepository/releases?per_page=100" 'api.github.com'
     $candidate = Select-UpdaterRelease $releases $installed $Channel
-    if (!$candidate) { return }
+    if (!$candidate) { return 'Current' }
 
-    $work = Join-Path $Root 'updater-work'
     Remove-UpdaterDirectory $Root 'updater-work'
     [void][IO.Directory]::CreateDirectory($work)
+    $started = $false
     try {
         $package = Join-Path $work $script:UpdaterPackageName
         $signature = "$package.sig"
@@ -243,13 +306,37 @@ function Install-UpdaterCandidate([string]$Root, [string]$Directory, [string]$Ch
         Assert-UpdaterWorker $staged
 
         $slot = if ($active.Slot -ceq 'updater-a') { 'updater-b' } else { 'updater-a' }
-        $next = Join-Path $Root $slot
-        Remove-UpdaterDirectory $Root $slot
-        [IO.Directory]::Move($staged, $next)
-        Write-Json (Join-Path $Root 'updater-active.json') @{ Schema = 1; Slot = $slot; Version = $candidate.Version }
-        @{ Directory = $next; Version = $candidate.Version }
+        $nextApp = Join-Path $work 'next-app'
+        Copy-Item -LiteralPath $staged -Destination $nextApp -Recurse
+        $shell = [Environment]::ProcessPath
+        Build-UpdaterLauncher $nextApp $shell
+        Write-Json (Join-Path $nextApp 'updater-slot.json') @{ Schema = 1; Slot = $slot; Version = $candidate.Version }
+
+        $start = [Diagnostics.ProcessStartInfo]::new($shell)
+        $start.UseShellExecute = $false
+        $start.WorkingDirectory = $Root
+        $continuation = ConvertTo-Json -Compress -Depth 5 @{ Options = $Resume; Directory = [Environment]::CurrentDirectory }
+        $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($continuation))
+        $parent = [Diagnostics.Process]::GetCurrentProcess()
+        try { $parentTicks = $parent.StartTime.ToUniversalTime().Ticks }
+        finally { $parent.Dispose() }
+        foreach ($arg in '-NoLogo','-NoProfile','-File',(Join-Path $staged 'Handoff.ps1'),
+            '-Root',$Root,'-ParentId',"$PID",'-ParentTicks',"$parentTicks",'-ResumePayload',$payload) {
+            [void]$start.ArgumentList.Add($arg)
+        }
+        $helper = [Diagnostics.Process]::Start($start)
+        try {
+            Write-Json $planPath @{
+                ProcessId = $helper.Id; StartTicks = $helper.StartTime.ToUniversalTime().Ticks
+                From = $installed.Text; FromSlot = $active.Slot; To = $candidate.Version; ToSlot = $slot
+            }
+            $started = $true
+        } finally { $helper.Dispose() }
+        'Handoff'
     } finally {
-        try { Remove-UpdaterDirectory $Root 'updater-work' }
-        catch { Write-Status WARN 'Updater staging cleanup needs manual attention.' }
+        if (!$started) {
+            try { Remove-UpdaterDirectory $Root 'updater-work' }
+            catch { Write-Status WARN 'Updater staging cleanup needs manual attention.' }
+        }
     }
 }

@@ -2,7 +2,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
     [Parameter(ParameterSetName = 'Install')][switch]$Install,
-    [Parameter(ParameterSetName = 'Install')][guid]$TestInstall,
+    [Parameter(ParameterSetName = 'Install')][Parameter(ParameterSetName = 'Uninstall')][guid]$TestInstall,
     [Parameter(Mandatory, ParameterSetName = 'Integrate')][switch]$Integrate,
     [Parameter(Mandatory, ParameterSetName = 'Uninstall')][switch]$Uninstall
 )
@@ -25,16 +25,10 @@ function Install-LauncherFiles([string]$Root) {
     if (!$shell) { throw 'PowerShell 7 could not be located.' }
     $probe = & $shell -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
     if ($LASTEXITCODE -or [version]$probe -lt [version]'7.5') { throw 'A usable PowerShell 7.5 or newer is required.' }
-    $compiler = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
-    if (!(Test-Path -LiteralPath $compiler)) {
-        $compiler = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
-    }
     $app = Join-Path $Root 'app'
-    $active = Join-Path $Root 'updater-active.json'
     $staged = Join-Path $Root ('app-staged-' + [guid]::NewGuid().ToString('N'))
     $previous = Join-Path $Root ('app-previous-' + [guid]::NewGuid().ToString('N'))
     Assert-LocalPath $app
-    Assert-LocalPath $active
     $config = Join-Path $Root 'config.json'
     Assert-LocalPath $config
     try {
@@ -46,10 +40,7 @@ function Install-LauncherFiles([string]$Root) {
             }
             Copy-Item -LiteralPath $source -Destination (Join-Path $staged $name)
         }
-        $launcher = Join-Path $staged 'ChromiumUpdater.exe'
-        & $compiler '/nologo' '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Web.Extensions.dll' "/out:$launcher" (Join-Path $staged 'Launcher.cs')
-        if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $launcher)) { throw 'Windows launcher compilation failed.' }
-        [IO.File]::WriteAllText((Join-Path $staged 'pwsh.path'), $shell)
+        Build-UpdaterLauncher $staged $shell
         Assert-UpdaterWorker $staged $shell
         if (!(Test-Path -LiteralPath $config)) {
             $example = Join-Path $staged 'config.example.json'
@@ -72,7 +63,6 @@ function Install-LauncherFiles([string]$Root) {
             if ($hadApp) { [IO.Directory]::Move($previous, $app) }
             throw
         }
-        [IO.File]::Delete($active)
     } finally {
         if (Test-Path -LiteralPath $staged) { Remove-LauncherDirectory $Root $staged }
     }
@@ -185,22 +175,20 @@ function Set-LauncherShortcuts([string]$Root, [bool]$Restore) {
 if ($PSBoundParameters.ContainsKey('TestInstall') -and $TestInstall -eq [guid]::Empty) {
     throw 'Provide a non-empty test installation ID.'
 }
-$root = if ($Uninstall) { Get-UpdaterRoot }
-elseif ($TestInstall -ne [guid]::Empty) { New-PrivateRoot ("$(Get-UpdaterRoot)-Test-$($TestInstall.ToString('N'))") }
-else { New-PrivateRoot }
+$root = if ($TestInstall -ne [guid]::Empty) { "$(Get-UpdaterRoot)-Test-$($TestInstall.ToString('N'))" }
+else { Get-UpdaterRoot }
+if (!$Uninstall) { $root = New-PrivateRoot $root }
 Assert-PrivateRoot $root
 $guard = Enter-UpdateLock $root 20
 if (!$guard) { throw 'A launcher operation is in progress. Retry after it finishes.' }
 try {
+    if (Test-PendingUpdaterHandoff $root) { throw 'An updater activation is pending. Retry after it finishes.' }
     if ($Integrate) { Set-LauncherShortcuts $root $false }
     elseif ($Uninstall) {
-        Set-LauncherShortcuts $root $true
+        if ($TestInstall -eq [guid]::Empty) { Set-LauncherShortcuts $root $true }
         $app = Join-Path $root 'app'
         if (Test-Path -LiteralPath $app) { Remove-LauncherDirectory $root $app }
-        $active = Join-Path $root 'updater-active.json'
-        Assert-LocalPath $active
-        [IO.File]::Delete($active)
-        foreach ($name in 'updater-work','updater-a','updater-b') { Remove-UpdaterDirectory $root $name }
+        foreach ($name in 'updater-work','updater-a','updater-b','updater-previous-app') { Remove-UpdaterDirectory $root $name }
         Write-Host '[ OK ] Launcher removed. Private configuration, logs and backups remain available for recovery.'
     } else { Install-LauncherFiles $root }
 } finally { $guard.Dispose() }

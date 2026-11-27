@@ -12,6 +12,7 @@ function New-PrivateRoot([string]$Root = (Get-UpdaterRoot)) {
         [void][IO.Directory]::CreateDirectory($root)
         $acl = [Security.AccessControl.DirectorySecurity]::new()
         $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
         foreach ($sid in @(Get-AllowedSid)) {
             $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
                 $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
@@ -85,10 +86,11 @@ function Enter-UpdateLock([string]$Root, [int]$WaitSeconds = 0) {
 }
 
 function Get-UpdaterSlot([string]$Root) {
-    $path = Join-Path $Root 'updater-active.json'
+    $app = Join-Path $Root 'app'
+    $path = Join-Path $app 'updater-slot.json'
     Assert-LocalPath $path
     if (![IO.File]::Exists($path)) {
-        return @{ Slot = 'app'; Directory = (Join-Path $Root 'app') }
+        return @{ Slot = 'app'; Directory = $app }
     }
     if ((Get-Item -LiteralPath $path).Length -gt 512) { throw 'Invalid updater activation record.' }
     $active = Read-Json $path
@@ -98,8 +100,12 @@ function Get-UpdaterSlot([string]$Root) {
     $directory = Join-Path $Root $active.Slot
     $version = Join-Path $directory 'Updater.version'
     Assert-LocalPath $version
+    $bootstrapVersion = Join-Path $app 'Updater.version'
+    Assert-LocalPath $bootstrapVersion
     if ($active.Version -isnot [string] -or $active.Version.Length -gt 128 -or
-        (Get-Item -LiteralPath $version).Length -gt 130 -or [IO.File]::ReadAllText($version).Trim() -cne $active.Version) {
+        (Get-Item -LiteralPath $version).Length -gt 130 -or [IO.File]::ReadAllText($version).Trim() -cne $active.Version -or
+        (Get-Item -LiteralPath $bootstrapVersion).Length -gt 130 -or
+        [IO.File]::ReadAllText($bootstrapVersion).Trim() -cne $active.Version) {
         throw 'The active updater version does not match its activation record.'
     }
     @{ Slot = $active.Slot; Directory = $directory }

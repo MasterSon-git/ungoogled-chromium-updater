@@ -271,13 +271,13 @@ function Invoke-Workflow($Root, $Config, $Previous) {
     @{ Status = Get-CheckStatus $results.ToArray(); Inventory = $extensions.Inventory }
 }
 
-function Invoke-UpdateSession([string]$Root, [bool]$AllowSelfUpdate = $true) {
+function Invoke-UpdateSession([string]$Root) {
     $pending = Join-Path $Root 'installation.json'
     Assert-LocalPath $pending
     $statePath = Join-Path $Root 'state.json'
     $config = Read-Config $root
     $state = Read-DailyState $statePath
-    $forceCheck = $Force -or $CheckOnly -or $Apply -or $Stage -or $VerifyCurrent
+    $forceCheck = $Force -or $CheckOnly -or $Apply -or $Stage -or $VerifyCurrent -or $SelfUpdateOutcome
     $due = Test-Due $state ([DateTimeOffset]::Now) $forceCheck
     $recover = Test-Path -LiteralPath $pending
     if ($Dispatch -and ($due -or $recover)) { return 10 }
@@ -291,15 +291,26 @@ function Invoke-UpdateSession([string]$Root, [bool]$AllowSelfUpdate = $true) {
     }
     if (!$CheckOnly -and !$Stage) { Enable-Log $root }
     if ($state.Status -eq 'Corrupt') { Write-Status WARN 'The previous daily check state was invalid. Running a fresh check.' }
-    if ($AllowSelfUpdate -and !$CheckOnly -and !$Stage -and $config['selfUpdateEnabled']) {
-        $next = try { Install-UpdaterCandidate $Root $PSScriptRoot $config.updaterChannel }
-        catch { Write-Status WARN (Get-SafeProblem $_ 'Updater self-update failed. Continuing with the current updater.') }
-        if ($next) {
-            Write-Status ' OK ' "Activated updater $($next.Version)."
-            return & {
-                . (Join-Path $next.Directory 'Worker.ps1')
-                Invoke-UpdateSession $Root $false
-            }
+    $updaterStatus = if ($SelfUpdateOutcome) { $SelfUpdateOutcome } else { 'Skipped' }
+    if ($SelfUpdateOutcome -ceq 'Applied') {
+        $version = (Get-UpdaterVersion (Join-Path $PSScriptRoot 'Updater.version')).Text
+        Write-Status ' OK ' "Activated updater $version."
+    } elseif ($SelfUpdateOutcome -ceq 'Failed') {
+        Write-Status WARN 'Updater activation failed. Continuing with the previous updater.'
+    } elseif ($Interactive -and !$CheckOnly -and !$Stage -and $config['selfUpdateEnabled']) {
+        $resume = @{
+            Force = [bool]$Force; Apply = [bool]$Apply; NoLaunch = [bool]$NoLaunch
+            VerifyCurrent = [bool]$VerifyCurrent; Interactive = [bool]$Interactive
+            BrowserArguments = $BrowserArguments
+        }
+        try {
+            $updaterStatus = Install-UpdaterCandidate $Root $PSScriptRoot $config.updaterChannel $resume
+            if ($updaterStatus -ceq 'Handoff') { return 20 }
+            if ($updaterStatus -ceq 'Unavailable') { Write-Status WARN 'Updater self-update is unavailable. This installation has no trusted release key.' }
+            if ($updaterStatus -ceq 'Deferred') { Write-Status WARN 'Another updater process is preparing activation.' }
+        } catch {
+            $updaterStatus = 'Failed'
+            Write-Status WARN (Get-SafeProblem $_ 'Updater self-update failed. Continuing with the current updater.')
         }
     }
     $outcome = Invoke-Workflow $root $config $state
@@ -307,7 +318,7 @@ function Invoke-UpdateSession([string]$Root, [bool]$AllowSelfUpdate = $true) {
         $now = [DateTimeOffset]::Now
         Write-Json $statePath @{
             Schema = 1; Day = $now.ToString('yyyy-MM-dd'); Attempt = $now.ToString('o')
-            Status = $outcome.Status; Inventory = $outcome.Inventory
+            Status = $outcome.Status; UpdaterStatus = $updaterStatus; Inventory = $outcome.Inventory
         }
     }
     switch ($outcome.Status) {
@@ -319,8 +330,8 @@ function Invoke-UpdateSession([string]$Root, [bool]$AllowSelfUpdate = $true) {
     if (!$NoLaunch -and !$CheckOnly -and !$Stage -and !(Test-Path -LiteralPath $pending)) {
         Start-Chromium $config $BrowserArguments
     }
-    if ($outcome.Status -eq 'Complete') { return 0 }
     if ($outcome.Status -eq 'Failed') { return 1 }
+    if ($outcome.Status -eq 'Complete' -and $updaterStatus -cnotin 'Failed','Deferred','Unavailable') { return 0 }
     2
 }
 
