@@ -8,6 +8,7 @@ function Get-UpdaterRoot {
 
 function New-PrivateRoot([string]$Root = (Get-UpdaterRoot)) {
     Assert-LocalPath $root
+    $root = [IO.Path]::GetFullPath($root)
     if (!(Test-Path -LiteralPath $root)) {
         [void][IO.Directory]::CreateDirectory($root)
         $acl = [Security.AccessControl.DirectorySecurity]::new()
