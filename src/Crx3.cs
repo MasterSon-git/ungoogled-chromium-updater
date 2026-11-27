@@ -9,6 +9,7 @@ using System.Text;
 // Read-only verifier for CRX3 packages. Chromium still performs installation.
 public static class Crx3
 {
+    // Chromium production Web Store publisher key hash. See THIRD_PARTY_NOTICES.md.
     private const string StoreKey = "61F7F2A6BFCF74CD0BC1FE2497CC9B04254C658F79F2145392867EA8366367CF";
 
     public sealed class Package
