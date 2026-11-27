@@ -4,7 +4,6 @@ $script:OldUboId = 'cjpalhdlnbpafiamejdnhcphjbkeiagm'
 $script:WebStoreId = 'ocaahdebbfolfmndjeplogmgcagdmblk'
 $script:UboUrl = 'https://cdn.jsdelivr.net/gh/gorhill/uBlock@master/dist/chromium/update.xml'
 $script:WebStoreUrl = 'https://raw.githubusercontent.com/NeverDecaf/chromium-web-store/master/updates.xml'
-$script:GitHubAssetHosts = @('github.com','release-assets.githubusercontent.com','objects.githubusercontent.com')
 
 function Initialize-CrxVerifier {
     if (!('Crx3' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'Crx3.cs') }
@@ -158,7 +157,7 @@ function Assert-ExtensionKey([string]$Id, $Manifest) {
     }
 }
 
-function Get-VerifiedManifest($Asset, [string]$Id, [bool]$Store) {
+function Get-VerifiedExtensionPackage($Asset, [string]$Id, [bool]$Store) {
     Initialize-CrxVerifier
     $limit = 32MB
     if ($Asset.Size -gt $limit) { throw 'The extension package exceeds the size limit.' }
@@ -172,7 +171,16 @@ function Get-VerifiedManifest($Asset, [string]$Id, [bool]$Store) {
         ($manifest['key'] -and $manifest['key'] -cne $verified.PublicKey)) {
         throw 'Signed package key or version did not match its metadata.'
     }
-    $manifest
+    @{ Manifest = $manifest; Bytes = $bytes; Proof = $verified }
+}
+
+function Get-VerifiedManifest($Asset, [string]$Id, [bool]$Store) {
+    (Get-VerifiedExtensionPackage $Asset $Id $Store).Manifest
+}
+
+function Test-FullUboManifest($Manifest) {
+    $Manifest['manifest_version'] -eq 2 -and $Manifest['update_url'] -cin @(
+        $script:UboUrl,'https://raw.githubusercontent.com/gorhill/uBlock/master/dist/chromium/update.xml')
 }
 
 function Get-PermissionChanges($Previous, $Candidate) {
@@ -196,7 +204,7 @@ function Test-ExtensionCandidate($Extension, [string]$Channel, $Asset, [version]
     $remote = Get-VerifiedManifest $Asset $Extension.Id ($Channel -eq 'Store')
     $validChannel = switch ($Channel) {
         Store { $remote['update_url'] -ceq $script:StoreUrl }
-        Ubo { $remote['manifest_version'] -eq 2 -and $remote['update_url'] -cin @($script:UboUrl,'https://raw.githubusercontent.com/gorhill/uBlock/master/dist/chromium/update.xml') }
+        Ubo { Test-FullUboManifest $remote }
         WebStoreHelper { $remote['update_url'] -ceq $script:WebStoreUrl }
     }
     if (!$validChannel) { throw 'Signed package changed its update source or required Manifest version.' }

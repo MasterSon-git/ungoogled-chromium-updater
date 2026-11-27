@@ -1,6 +1,6 @@
 # Ungoogled Chromium Updater
 
-This Windows launcher checks the official ungoogled-chromium Windows release, compares its version with broadly served Google Chrome stable, and audits installed extension update channels. It can run the official per-user browser installer after release approval and a closed-browser backup. Extension installation uses Chromium's prompts.
+This Windows launcher automatically installs eligible stable builds from the official ungoogled-chromium Windows distribution when Chromium is closed. It verifies the installer, checks Manifest V2 compatibility when needed, and backs up the browser and profiles before installation. It reports the remaining Chrome stable patch gap and audits installed extension update channels. Extension installation uses Chromium's prompts.
 
 ## Install
 
@@ -16,6 +16,8 @@ notepad (Join-Path $updater 'config.json')
 
 Setup builds the small Windows launcher with the Windows .NET Framework C# compiler. It installs everything under `%LOCALAPPDATA%\UngoogledChromiumUpdater`. Configuration starts with [config.example.json](config.example.json). Select the installed browser architecture (`x64`, `arm64`, or `x86`), browser executable, and user-data directory. The installer workflow supports the registered per-user installation in `%LOCALAPPDATA%\Chromium`. Use `browserArgs` for arguments shared by all launches. Leave it empty for arguments already present on your shortcuts.
 
+Keep a current, trusted installation of [official 7-Zip](https://www.7-zip.org/download.html) in Program Files for MV2 testing, same-version packaging updates, or initializing a legacy release record. The updater reports its version when it extracts an installer payload. In Automatic mode, launch normally after reviewing `browserTrust`. Choose Manual mode to require an exact tag and SHA-256 approval and an explicit `-Apply`. On upgrade, Setup backs up legacy settings, migrates them to Manual mode, and records the installed packaging revision if it can verify the existing evidence. Review the standing trust policy and select Automatic explicitly when ready. See [browser maintenance](docs/maintenance.md).
+
 Add a verified Chrome Web Store extension's exact ID to `extensions` with the value `"ChromeWebStore"` after checking its official listing and developer identity. See [extension maintenance](docs/extensions.md) for official GitHub channels and migration. The first run reports unapproved sources for review.
 
 ## Launch and check
@@ -27,11 +29,12 @@ $update = Join-Path $env:LOCALAPPDATA 'UngoogledChromiumUpdater\app\Update.ps1'
 & $update -Force
 & $update -CheckOnly -VerifyCurrent
 & $update -Stage
+& $update -Stage -TestCompatibility
 & $update -Apply -NoLaunch
 & $update -Force -BrowserArguments @('--profile-directory=Default','https://example.com/')
 ```
 
-`-CheckOnly` checks release metadata and, where needed, verifies extension packages in memory. `-VerifyCurrent` also checks signed packages for the same installed version. `-Stage` additionally downloads and verifies the current Windows installer when an update is available. These two modes keep the daily state and browser untouched. The script returns 0 for a completed check, 1 for failure, and 2 for pending action or deferral.
+`-CheckOnly` checks release metadata and, where needed, verifies extension packages in memory. `-VerifyCurrent` also checks signed packages for the same installed version. `-Stage` stages and verifies the installer for an available update or an unknown installed packaging revision. Add `-TestCompatibility` to run the isolated test with the latest verified stable full uBlock Origin and cache a pass for the exact artifacts. The result identifies the tested version and warns if an installed full uBlock Origin version differs. Other MV2 extensions are outside the test. These modes leave the installed browser, production profiles, and daily check state untouched. The script returns 0 for a completed check, 1 for failure, and 2 for pending action or deferral. Read the individual results for patch-gap warnings and compatibility outcomes.
 
 Pass browser arguments directly to `app\ChromiumUpdater.exe` for a quiet shortcut invocation with normal daily behavior. It forwards URLs and arguments as individual strings. The launcher only coordinates launches that go through it.
 

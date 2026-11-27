@@ -1,5 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:GitHubAssetHosts = @('github.com','release-assets.githubusercontent.com','objects.githubusercontent.com')
 
 function Get-UpdaterRoot {
     Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'UngoogledChromiumUpdater'
@@ -83,12 +84,31 @@ function Enter-UpdateLock([string]$Root, [int]$WaitSeconds = 0) {
     } while ($true)
 }
 
+function Convert-LegacyBrowserConfig($Config) {
+    if ($Config.Contains('browserUpdateMode')) { return $false }
+    if ($Config['installOnLaunch'] -isnot [bool]) { throw 'Invalid legacy browser configuration.' }
+    $approval = $Config['browserApproval']
+    $Config['browserApproval'] = if ($approval -is [Collections.IDictionary]) {
+        @{ tag = $approval['tag']; sha256 = $approval['sha256'] }
+    } else { $null }
+    $Config['browserUpdateMode'] = 'Manual'
+    $Config['browserTrust'] = @{ allowUnsigned = $false; signerSha256 = $null }
+    $Config.Remove('installOnLaunch')
+    $true
+}
+
 function Read-Config([string]$Root) {
     $path = Join-Path $Root 'config.json'
     Assert-LocalPath $path
     $config = Read-Json $path
+    $legacy = Convert-LegacyBrowserConfig $config
+    $config['legacyBrowserConfig'] = $legacy
+    $trust = $config['browserTrust']
     if ($config.architecture -cnotin 'x86','x64','arm64' -or
-        $config.installOnLaunch -isnot [bool] -or $config.extensions -isnot [Collections.IDictionary] -or
+        $config.browserUpdateMode -cnotin 'Automatic','Manual' -or
+        $trust -isnot [Collections.IDictionary] -or $trust['allowUnsigned'] -isnot [bool] -or
+        ($null -ne $trust['signerSha256'] -and $trust['signerSha256'] -cnotmatch '^[a-fA-F0-9]{64}$') -or
+        $config.extensions -isnot [Collections.IDictionary] -or
         $config.browserArgs -isnot [array] -or @($config.browserArgs | Where-Object { $_ -isnot [string] }).Count) {
         throw 'Invalid browser configuration.'
     }

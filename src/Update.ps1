@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [switch]$Force, [switch]$CheckOnly, [switch]$Stage, [switch]$Apply, [switch]$NoLaunch,
-    [switch]$VerifyCurrent, [switch]$Dispatch, [switch]$Interactive,
+    [switch]$VerifyCurrent, [switch]$TestCompatibility, [switch]$Dispatch, [switch]$Interactive,
     [string]$Payload,
     [string[]]$BrowserArguments = @()
 )
@@ -10,6 +10,8 @@ param(
 . (Join-Path $PSScriptRoot 'Common.ps1')
 . (Join-Path $PSScriptRoot 'Extensions.ps1')
 . (Join-Path $PSScriptRoot 'Browser.ps1')
+. (Join-Path $PSScriptRoot 'BrowserPayload.ps1')
+. (Join-Path $PSScriptRoot 'Mv2.ps1')
 
 $script:log = $null
 function Write-Status([string]$Level, [string]$Message, [string]$LogMessage = $Message) {
@@ -45,7 +47,11 @@ function Enable-Log([string]$Root) {
 
 function Get-SafeProblem($ErrorRecord, [string]$Fallback) {
     $reason = $ErrorRecord.Exception.Message
-    if ($reason -cmatch '^The update request timed out\.$|^Update server returned HTTP \d{3}\.$|^The Chromium installer exited with code -?\d+\.$|^Backup copy failed or was inconsistent \(Robocopy exit \d+\)\.$') {
+    if ($reason -cmatch ('^The update request timed out\.$|^Update server returned HTTP \d{3}\.$|' +
+        '^The Chromium installer exited with code -?\d+\.$|^Backup copy failed or was inconsistent \(Robocopy exit \d+\)\.$|' +
+        '^Windows installer has an invalid Authenticode status\.$|^The Windows installer signer does not match the configured pin\.$|' +
+        '^The standing browser policy does not accept this unsigned installer\.$|^Browser installer SHA-256 or byte count mismatch\.$|' +
+        '^The installed browser files do not match the verified installer payload\.$')) {
         return "$Fallback $reason"
     }
     $Fallback
@@ -96,8 +102,7 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
                     if (!$releases['Ubo']) { $releases['Ubo'] = Get-ExtensionRelease 'Ubo' }
                     $asset = $releases['Ubo']
                     $signed = Get-VerifiedManifest $asset $script:UboId $false
-                    if ($signed.manifest_version -ne 2 -or $signed['update_url'] -cnotin @(
-                        $script:UboUrl,'https://raw.githubusercontent.com/gorhill/uBlock/master/dist/chromium/update.xml')) {
+                    if (!(Test-FullUboManifest $signed)) {
                         throw 'Unexpected Manifest version or source for full uBlock Origin.'
                     }
                     $review = if (@(Get-PermissionChanges $manifest $signed).Count) { ' Review changed permissions.' } else { '' }
@@ -132,10 +137,109 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
     @{ Status = Get-CheckStatus $statuses.ToArray(); Inventory = $observed }
 }
 
+function Test-Mv2Needed($Inventory) {
+    @($Inventory | Where-Object { $_.Location -notin 5,10 -and (!$_.Manifest -or $_.Manifest['manifest_version'] -ne 3) }).Count -gt 0
+}
+
+function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [bool]$InventoryReady, $Inventory) {
+    $release = Get-BrowserReleaseStatus $Root $Config $Installed $Candidate
+    switch ($release) {
+        Older { Write-Status WARN 'The installed Chromium version or packaging revision is newer than the official stable candidate.' }
+        UnknownRevision { Write-Status WARN 'The installed Windows packaging revision is unknown. Same-version installation is blocked until a newer Chromium version is available.' }
+        ChangedRelease { Write-Status ERROR 'Official release metadata changed for the recorded packaging revision. Review the source before updating.' }
+        Current { Write-Status ' OK ' "Installed Windows distribution release $($Candidate.Tag) is current." }
+    }
+    if ($release -eq 'ChangedRelease') { return @{ Status = 'Failed'; Version = $Installed } }
+    if ($Stage -and ($release -in 'Newer','UnknownRevision' -or ($TestCompatibility -and $release -eq 'Current'))) {
+        $artifact = Get-BrowserArtifact $Root $Candidate
+        Write-Status INFO "Staged $($Candidate.Tag) installer SHA-256 $($Candidate.Digest)."
+        if ($TestCompatibility) {
+            Assert-BrowserTrust $Config.browserTrust $artifact
+            $test = Get-BrowserCompatibility $Root $Candidate $artifact $true
+            $status = Write-CompatibilityResult $test $Inventory
+            if ($status -ne 'Complete') { return @{ Status = $status; Version = $Installed } }
+        }
+    }
+    if ($release -ne 'Newer') {
+        $status = if ($release -eq 'Current') { 'Complete' } else { 'Action' }
+        return @{ Status = $status; Version = $Installed }
+    }
+    $status = 'Action'
+    if ($CheckOnly -or $Stage -or !$InventoryReady) {
+        Write-Status WARN 'A newer official Windows release is available.'
+    } elseif ($Config.browserUpdateMode -eq 'Manual' -and
+        (!$Apply -or !(Test-BrowserApproval $Config['browserApproval'] $Candidate))) {
+        Write-Status WARN 'Manual mode requires the matching tag and SHA-256 in browserApproval and an explicit -Apply.'
+    } elseif (@(@($Config.browserArgs) + $BrowserArguments | Where-Object { $_ -match '^--user-data-dir(?:=|$)' }).Count) {
+        Write-Status WARN 'The launch requests a different user-data directory. Update the standard profile separately.'
+        $status = 'Deferred'
+    } elseif (Test-BrowserBusy $Config) {
+        Write-Status WARN 'Browser update deferred. Close Chromium manually before the next installation attempt.'
+        $status = 'Deferred'
+    } else {
+        Assert-RegisteredInstall $Config $Installed
+        $artifact = Get-BrowserArtifact $Root $Candidate
+        Assert-BrowserTrust $Config.browserTrust $artifact
+        $installInventory = @(Get-ExtensionInventory $Config.userData)
+        $hasMv2 = (Test-Mv2Needed $Inventory) -or (Test-Mv2Needed $installInventory)
+        $payload = $null
+        if ($hasMv2 -or $Candidate.Version -eq $Installed) {
+            $test = Get-BrowserCompatibility $Root $Candidate $artifact $hasMv2
+            $status = Write-CompatibilityResult $test $installInventory
+            if ($status -ne 'Complete') { return @{ Status = $status; Version = $Installed } }
+            $payload = $test.Files
+        }
+        if (!$hasMv2 -and (Test-Mv2Needed @(Get-ExtensionInventory $Config.userData))) {
+            Write-Status WARN 'The profile now requires an MV2 compatibility check. Retry the browser update.'
+            return @{ Status = 'Deferred'; Version = $Installed }
+        }
+        if ((Install-BrowserCandidate $Root $Config $Installed $Candidate $artifact $payload) -eq 'Deferred') {
+            Write-Status WARN 'Browser update deferred. Close Chromium manually before the next installation attempt.'
+            $status = 'Deferred'
+        } else {
+            $Installed = $Candidate.Version
+            Write-Status ' OK ' "Installed and verified Windows distribution release $($Candidate.Tag)."
+            $status = 'Complete'
+        }
+    }
+    @{ Status = $status; Version = $Installed }
+}
+
+function Write-CompatibilityResult($Test, $Inventory) {
+    if ($Test['UboVersion']) {
+        $tested = Get-Version $Test.UboVersion
+        Write-Status INFO "The isolated MV2 test covers full uBlock Origin $($Test.UboVersion) from GitHub. Other installed MV2 extensions were not tested."
+        $different = foreach ($extension in $Inventory) {
+            if ($extension.Id -notin $script:UboId,$script:OldUboId) { continue }
+            $version = if ($extension.Manifest) { $extension.Manifest['version'] }
+            try {
+                if ((Get-Version $version) -ne $tested) { $version }
+            } catch { 'unknown' }
+        }
+        if ($different) {
+            $versions = ($different | Sort-Object -Unique) -join ', '
+            Write-Status WARN "Installed full uBlock Origin version(s) $versions were not matched by the test of $($Test.UboVersion). Compatibility for those installations is unverified."
+        }
+    }
+    if ($Test.Status -eq 'Pass') {
+        Write-Status ' OK ' "Browser compatibility pass. $($Test.Detail)"
+        return 'Complete'
+    }
+    $level = if ($Test.Status -eq 'OperationalFailure') { 'ERROR' } else { 'WARN' }
+    $label = switch ($Test.Status) { OperationalFailure { 'operational failure' } default { $Test.Status.ToLowerInvariant() } }
+    Write-Status $level "Browser compatibility $label. $($Test.Detail) See browser maintenance before applying this release."
+    if ($level -eq 'ERROR') { return 'Failed' }
+    'Action'
+}
+
 function Invoke-Workflow($Root, $Config, $Previous) {
     $results = [Collections.Generic.List[string]]::new()
     $installed = Get-BrowserVersion $Config.browserPath $Config.architecture
     Write-Status CHECK "Installed Chromium $installed ($($Config.architecture))."
+    if ($Config['legacyBrowserConfig']) {
+        Write-Status WARN 'Legacy settings are in safe Manual mode. Run Setup.ps1 -Install and review browserTrust to migrate.'
+        $results.Add('Action')
+    }
     $inventory = @()
     $inventoryReady = $false
     try {
@@ -145,55 +249,26 @@ function Invoke-Workflow($Root, $Config, $Previous) {
         Write-Status ERROR 'Chromium extension inventory could not be read. Browser installation is blocked until this check works.'
         $results.Add('Failed')
     }
-    $hasMv2 = @($inventory | Where-Object { $_.Location -notin 5,10 -and (!$_.Manifest -or $_.Manifest['manifest_version'] -ne 3) }).Count -gt 0
     try {
-        $stable = Get-UpstreamStable $Config.architecture
-        Write-Status INFO "Broadly served Google Chrome stable: $stable. See Google Chrome Releases for security advisories."
         $candidate = Get-WindowsCandidate $Config.architecture
         Write-Status CHECK "Official stable ungoogled-chromium Windows build: $($candidate.Tag)."
-        if ($candidate.Version -lt $stable -and $installed -lt $stable) {
-            Write-Status WARN 'The Windows channel trails Google Chrome stable. Review upstream security fixes before postponing maintenance.'
-            $results.Add('Action')
-        }
-        if ($candidate.Version -lt $installed) {
-            Write-Status WARN 'The installed version is newer than the listed stable Windows release.'
-            $results.Add('Action')
-        } elseif ($candidate.Version -eq $installed) {
-            Write-Status ' OK ' 'Chromium is current for the Windows distribution.'
-        } else {
-            $approved = Test-BrowserApproval $Config.browserApproval $candidate $stable $hasMv2
-            if ($hasMv2 -and (!$approved -or $Config.browserApproval['mv2RuntimeVerified'] -ne $true)) {
-                Write-Status WARN 'Installed MV2 add-ons require isolated runtime validation for this exact Windows release before installation.'
-            } elseif ($hasMv2) {
-                Write-Status INFO 'The configured exact-release approval records an isolated MV2 test. Profile-specific behavior still needs validation.'
-            }
-            $canInstall = !$CheckOnly -and !$Stage -and ($Apply -or $Config.installOnLaunch)
-            if (($Stage -or ($canInstall -and $inventoryReady -and $approved)) -and $candidate.Version -gt $installed) {
-                $artifact = Get-BrowserArtifact $Root $candidate
-            }
-            if (!$approved) {
-                Write-Status WARN 'The available browser release needs an exact release approval. See the browser update procedure.'
-                $results.Add('Action')
-            } elseif (!$canInstall -or !$inventoryReady) {
-                Write-Status WARN 'Browser update available. Use the verified install procedure when ready.'
-                $results.Add('Action')
-            } elseif (@(@($Config.browserArgs) + $BrowserArguments | Where-Object { $_ -match '^--user-data-dir(?:=|$)' }).Count) {
-                Write-Status WARN 'The launch requests a different user-data directory. Update the standard profile separately.'
-                $results.Add('Deferred')
-            } else {
-                $update = Install-BrowserCandidate $Root $Config $installed $candidate $artifact
-                if ($update -eq 'Deferred') {
-                    Write-Status WARN 'Browser update deferred. Close Chromium manually before the next installation attempt.'
-                    $results.Add('Deferred')
-                } else {
-                    $installed = $candidate.Version
-                    Write-Status ' OK ' "Installed and verified Chromium $installed."
-                }
-            }
-        }
+        $update = Invoke-BrowserUpdate $Root $Config $installed $candidate $inventoryReady $inventory
+        $installed = $update.Version
+        $results.Add($update.Status)
     } catch {
         Write-Status ERROR (Get-SafeProblem $_ 'Browser update check or installation failed. Review download verification and recovery instructions.')
         $results.Add('Failed')
+    }
+    try {
+        $stable = Get-UpstreamStable $Config.architecture
+        Write-Status INFO "Broadly served Google Chrome stable is $stable."
+        if ($installed -lt $stable) {
+            Write-Status WARN "Installed Chromium $installed trails Chrome stable $stable. Review upstream security advisories for the remaining patch gap."
+            $results.Add('Action')
+        }
+    } catch {
+        Write-Status WARN (Get-SafeProblem $_ 'Chrome stable comparison is unavailable. The official Windows release is verified independently.')
+        $results.Add('Action')
     }
     $extensions = if ($inventoryReady) {
         Invoke-ExtensionChecks $inventory $Config $installed $Previous.Inventory $VerifyCurrent
@@ -210,10 +285,11 @@ function Invoke-Launcher {
             throw 'Invalid launcher arguments.'
         }
     }
-    if (($CheckOnly -and $Apply) -or ($Stage -and $Apply)) { throw 'Choose one of check-only, stage or apply.' }
+    if ((@($CheckOnly,$Stage,$Apply) -eq $true).Count -gt 1 -or ($TestCompatibility -and !$Stage)) {
+        throw 'Choose one of check-only, stage or apply. Compatibility testing requires -Stage.'
+    }
     $root = Get-UpdaterRoot
     Assert-PrivateRoot $root
-    $config = Read-Config $root
     $statePath = Join-Path $root 'state.json'
     $pending = Join-Path $root 'installation.json'
     Assert-LocalPath $pending
@@ -228,6 +304,7 @@ function Invoke-Launcher {
         }
     }
     try {
+        $config = Read-Config $root
         $state = Read-DailyState $statePath
         $forceCheck = $Force -or $CheckOnly -or $Apply -or $Stage -or $VerifyCurrent
         $due = Test-Due $state ([DateTimeOffset]::Now) $forceCheck
@@ -266,6 +343,7 @@ function Invoke-Launcher {
     } finally { $lock.Dispose() }
 }
 
+if ($MyInvocation.InvocationName -eq '.') { return }
 try { $code = Invoke-Launcher }
 catch {
     if ($Dispatch) { exit 10 }

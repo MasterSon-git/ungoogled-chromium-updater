@@ -1,7 +1,5 @@
 #Requires -Version 7.5
-. (Join-Path $PSScriptRoot '../src/Common.ps1')
-. (Join-Path $PSScriptRoot '../src/Extensions.ps1')
-. (Join-Path $PSScriptRoot '../src/Browser.ps1')
+. (Join-Path $PSScriptRoot '../src/Update.ps1')
 
 function Assert-Equal($Actual, $Expected) {
     if ($Actual -cne $Expected) { throw "Expected [$Expected], got [$Actual]." }
@@ -24,8 +22,9 @@ function Test-Case([string]$Name, [scriptblock]$Action) {
 }
 
 function Write-Status($Level, $Message) { }
-$root = Join-Path (New-PrivateRoot) ('tests-' + [guid]::NewGuid().ToString('N'))
-[void][IO.Directory]::CreateDirectory($root)
+$script:testRoot = Join-Path $env:TEMP ('uc-updater-tests-' + [guid]::NewGuid().ToString('N'))
+function Get-UpdaterRoot { $script:testRoot }
+$root = New-PrivateRoot
 
 try {
     Test-Case 'daily success, local day rollover, forced check and retry timing' {
@@ -99,18 +98,238 @@ try {
         Assert-Fails { Invoke-TrustedGet 'https://github.com@example.test/example' @('github.com') } 'source allowlist'
     }
 
-    Test-Case 'MV2 compatibility, artifact hash and stable gap gate' {
+    Test-Case 'migration retains exact approval and asks for new standing trust' {
+        foreach ($setting in $true,$false) {
+            $config = @{ installOnLaunch = $setting; browserApproval = @{ tag = '158.0.8127.36-1.1'
+                sha256 = 'b' * 64; allowUnsigned = $true; mv2RuntimeVerified = $true; acceptedStableVersion = '160.1.1.1' } }
+            Assert-Equal (Convert-LegacyBrowserConfig $config) $true
+            Assert-Equal $config.browserUpdateMode 'Manual'
+            Assert-Equal $config.browserTrust.allowUnsigned $false
+            Assert-Equal $config.browserApproval.Count 2
+            Assert-Equal $config.browserApproval.tag '158.0.8127.36-1.1'
+            Assert-Equal ($config.ContainsKey('installOnLaunch')) $false
+            Assert-Equal (Convert-LegacyBrowserConfig $config) $false
+        }
+    }
+
+    Test-Case 'manual approval is exact and signature trust is independent' {
         $candidate = @{ Tag = '158.0.8127.36-1.1'; Digest = 'b' * 64; Version = [version]'158.0.8127.36' }
-        $stable = [version]'158.0.8127.89'
-        $approval = @{ tag = $candidate.Tag; sha256 = $candidate.Digest; allowUnsigned = $true }
-        Assert-Equal (Test-BrowserApproval $approval $candidate $stable $true) $false
-        $approval.mv2RuntimeVerified = $true
-        Assert-Equal (Test-BrowserApproval $approval $candidate $stable $true) $false
-        $approval.acceptedStableVersion = $stable.ToString()
-        Assert-Equal (Test-BrowserApproval $approval $candidate $stable $true) $true
-        Assert-Equal (Test-BrowserApproval $approval $candidate ([version]'159.0.8154.33') $true) $false
+        $approval = @{ tag = $candidate.Tag; sha256 = $candidate.Digest }
+        Assert-Equal (Test-BrowserApproval $approval $candidate) $true
         $approval.sha256 = 'c' * 64
-        Assert-Equal (Test-BrowserApproval $approval $candidate $stable $true) $false
+        Assert-Equal (Test-BrowserApproval $approval $candidate) $false
+        $trust = @{ allowUnsigned = $true; signerSha256 = $null }
+        Assert-BrowserTrust $trust @{ Signer = $null }
+        Assert-Fails { Assert-BrowserTrust $trust @{ Signer = 'a' * 64 } } 'configured pin'
+        $trust.signerSha256 = 'a' * 64
+        Assert-BrowserTrust $trust @{ Signer = 'A' * 64 }
+        Assert-Fails { Assert-BrowserTrust $trust @{ Signer = 'b' * 64 } } 'configured pin'
+        Assert-Fails { Assert-BrowserTrust $trust @{ Signer = $null } } 'standing browser policy'
+    }
+
+    Test-Case 'known packaging revisions compare numerically and unknown revisions never reinstall' {
+        $version = [version]'158.0.8127.36'
+        $config = @{ architecture = 'x64' }
+        $candidate = @{ Tag = '158.0.8127.36-1.11'; Digest = 'b' * 64; Version = $version
+            Revision = (Convert-WindowsTag '158.0.8127.36-1.11').Revision }
+        $path = Join-Path $root 'browser-release.json'
+        function Get-InstalledBrowserIdentity($Config, $Version) { 'a' * 64 }
+        Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'UnknownRevision'
+        $record = @{ Tag = '158.0.8127.36-1.2'; Digest = 'a' * 64; Architecture = 'x64'; Identity = 'a' * 64 }
+        Write-Json $path $record
+        Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'Newer'
+        $record.Tag = '158.0.8127.36-2'
+        Write-Json $path $record
+        Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'Older'
+        $record.Tag = $candidate.Tag
+        Write-Json $path $record
+        Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'ChangedRelease'
+        $record.Digest = $candidate.Digest
+        Write-Json $path $record
+        Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'Current'
+        $record.Identity = 'f' * 64
+        Write-Json $path $record
+        Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'UnknownRevision'
+        Assert-Equal (Get-BrowserReleaseStatus $root $config ([version]'159.0.0.0') $candidate) 'Older'
+        [IO.File]::Delete($path)
+    }
+
+    Test-Case 'migration records a release only with matching legacy install evidence and installed hashes' {
+        $version = [version]'158.0.8127.36'
+        $fixtureCandidate = @{ Tag = "$version-1.1"; Digest = 'b' * 64; Version = $version; Architecture = 'x64' }
+        $approval = @{ tag = $fixtureCandidate.Tag; sha256 = $fixtureCandidate.Digest; allowUnsigned = $true }
+        $app = Join-Path $root 'migration-app'
+        $setup = Join-Path $app "$version\Installer\setup.exe"
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($setup))
+        $config = @{ browserPath = (Join-Path $app 'chrome.exe'); architecture = 'x64' }
+        $expected = @{}
+        foreach ($full in $config.browserPath,(Join-Path $app 'chrome_proxy.exe'),(Join-Path $app "$version\chrome.dll"),$setup) {
+            [IO.File]::WriteAllText($full, [IO.Path]::GetFileName($full))
+            $expected[[IO.Path]::GetRelativePath($app, $full)] = (Get-FileHash -LiteralPath $full).Hash
+        }
+        $logs = Join-Path $root 'logs'
+        [void][IO.Directory]::CreateDirectory($logs)
+        $log = Join-Path $logs '2026-11-27.log'
+        $lines = @(
+            "[CHECK] Official stable ungoogled-chromium Windows build: $($fixtureCandidate.Tag)."
+            '[ OK ] Windows installer matches the published SHA-256 and byte count.'
+            '[INFO] Running the verified per-user Chromium installer.'
+            "[ OK ] Installed and verified Chromium $version."
+        ) | ForEach-Object { "2026-11-27T10:00:00.0000000+01:00 $_" }
+        function Get-BrowserVersion { $version }
+        function Get-WindowsCandidate { $fixtureCandidate }
+        function Get-BrowserArtifact { @{ Signer = $null } }
+        function Assert-RegisteredInstall { }
+        function Expand-BrowserPayload($Lab, $Candidate, $Artifact, [switch]$IncludeSetup) {
+            Assert-Equal $IncludeSetup.IsPresent $true
+            @{ Files = $expected }
+        }
+        $record = Join-Path $root 'browser-release.json'
+        [IO.File]::WriteAllLines($log, [string[]]$lines[0..2])
+        Assert-Equal (Initialize-BrowserRelease $root $config $approval) $null
+        Assert-Equal ([IO.File]::Exists($record)) $false
+        [IO.File]::WriteAllLines($log, [string[]]($lines + $lines[0..2]))
+        Assert-Equal (Initialize-BrowserRelease $root $config $approval) $null
+        [IO.File]::WriteAllLines($log, [string[]]$lines)
+        $approval.sha256 = 'c' * 64
+        Assert-Equal (Initialize-BrowserRelease $root $config $approval) $null
+        $approval.sha256 = $fixtureCandidate.Digest
+        [IO.File]::WriteAllText($setup, 'different setup')
+        Assert-Equal (Initialize-BrowserRelease $root $config $approval) $null
+        Assert-Equal ([IO.File]::Exists($record)) $false
+        [IO.File]::WriteAllText($setup, 'setup.exe')
+        $marker = Join-Path $root 'installation.json'
+        Write-Json $marker @{}
+        Assert-Equal (Initialize-BrowserRelease $root $config $approval) $null
+        [IO.File]::Delete($marker)
+        Assert-Equal (Initialize-BrowserRelease $root $config $approval) $fixtureCandidate.Tag
+        Assert-Equal (Read-Json $record).Digest $fixtureCandidate.Digest
+        Assert-Equal (Read-Json $record).Identity (Get-InstalledBrowserIdentity $config $version)
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $root 'mv2-work'))) $false
+        [IO.File]::Delete($record)
+        [IO.File]::Delete($log)
+    }
+
+    Test-Case 'compatibility reporting distinguishes the verified fixture from installed extensions' {
+        $messages = [Collections.Generic.List[string]]::new()
+        function Write-Status($Level, $Message) { $messages.Add("$Level $Message") }
+        $inventory = @(
+            @{ Id = $script:UboId; Manifest = @{ version = '1.77.2.0' } }
+            @{ Id = $script:OldUboId; Manifest = @{ version = '1.77.1' } }
+            @{ Id = 'a' * 32; Manifest = @{ version = '3.0'; manifest_version = 2 } }
+        )
+        Assert-Equal (Write-CompatibilityResult @{ Status = 'Pass'; Detail = 'fixture'; UboVersion = '1.77.2' } $inventory) 'Complete'
+        Assert-Equal (@($messages -like '*Other installed MV2 extensions were not tested.*').Count) 1
+        Assert-Equal (@($messages -like 'WARN *1.77.1*test of 1.77.2*unverified*').Count) 1
+        Assert-Equal (@($messages -like 'WARN *1.77.2.0*').Count) 0
+        Assert-Equal (@($messages -like '*3.0*').Count) 0
+    }
+
+    Test-Case 'workflow installs with a patch gap or unavailable Chrome history, and requires MV2 pass' {
+        $config = @{ browserPath = 'fixture'; userData = 'fixture'; architecture = 'x64'; browserArgs = @()
+            browserUpdateMode = 'Automatic'; browserTrust = @{ allowUnsigned = $true; signerSha256 = $null } }
+        $candidate = @{ Tag = '158.0.8127.36-1.1'; Digest = 'b' * 64; Version = [version]'158.0.8127.36' }
+        $record = @{ Installs = 0; GateStatus = 'Pass'; Messages = [Collections.Generic.List[string]]::new() }
+        $fixtureInventory = @(@{ Location = 1; Enabled = $false; Manifest = @{ manifest_version = 2 } })
+        function Write-Status($Level, $Message) { $record.Messages.Add($Message) }
+        function Get-BrowserVersion { [version]'157.0.8000.1' }
+        function Get-WindowsCandidate { $candidate }
+        function Get-ExtensionInventory { $fixtureInventory }
+        function Invoke-ExtensionChecks { @{ Status = 'Complete'; Inventory = @{} } }
+        function Get-UpstreamStable { [version]'158.0.8127.89' }
+        function Test-BrowserBusy { $false }
+        function Assert-RegisteredInstall { }
+        function Get-BrowserArtifact { @{ Signer = $null } }
+        function Install-BrowserCandidate { $record.Installs++; 'Installed' }
+        function Get-BrowserCompatibility($Root, $Candidate, $Artifact, $NeedsMv2) {
+            Assert-Equal $NeedsMv2 $true
+            @{ Status = $record.GateStatus; Detail = 'fixture'; Files = @{ 'chrome.exe' = 'hash' } }
+        }
+        $previous = @{ Inventory = @{} }
+        Assert-Equal (Invoke-Workflow $root $config $previous).Status 'Action'
+        Assert-Equal $record.Installs 1
+        Assert-Equal (@($record.Messages -like '*158.0.8127.36 trails Chrome stable 158.0.8127.89*').Count) 1
+        function Get-UpstreamStable { throw 'service unavailable' }
+        Assert-Equal (Invoke-Workflow $root $config $previous).Status 'Action'
+        Assert-Equal $record.Installs 2
+        Assert-Equal (@($record.Messages -like '*comparison is unavailable*').Count) 1
+        foreach ($gateStatus in 'Incompatible','Inconclusive','OperationalFailure') {
+            $record.GateStatus = $gateStatus
+            $outcome = Invoke-Workflow $root $config $previous
+            Assert-Equal $outcome.Status $(if ($gateStatus -eq 'OperationalFailure') { 'Failed' } else { 'Action' })
+            Assert-Equal $record.Installs 2
+        }
+        $record.GateStatus = 'Pass'
+        $config.browserUpdateMode = 'Manual'
+        $config.browserApproval = @{ tag = $candidate.Tag; sha256 = $candidate.Digest }
+        [void](Invoke-Workflow $root $config $previous)
+        Assert-Equal $record.Installs 2
+        $Apply = $true
+        $config.browserApproval.sha256 = 'c' * 64
+        [void](Invoke-Workflow $root $config $previous)
+        Assert-Equal $record.Installs 2
+        $config.browserApproval.sha256 = $candidate.Digest
+        [void](Invoke-Workflow $root $config $previous)
+        Assert-Equal $record.Installs 3
+        function Test-BrowserBusy { $true }
+        Assert-Equal (Invoke-Workflow $root $config $previous).Status 'Deferred'
+        Assert-Equal $record.Installs 3
+        function Test-BrowserBusy { $false }
+        function Get-BrowserArtifact { throw 'Browser installer SHA-256 or byte count mismatch.' }
+        Assert-Equal (Invoke-Workflow $root $config $previous).Status 'Failed'
+        Assert-Equal $record.Installs 3
+    }
+
+    Test-Case 'MV2 cache only accepts exact verified identities and successful runs' {
+        $candidate = @{ Tag = '158.0.8127.36-1.1'; Digest = 'b' * 64; Version = [version]'158.0.8127.36'
+            Architecture = 'x64'; Size = 10 }
+        $asset = @{ Version = '1.77.2'; Digest = 'c' * 64; Size = 5 }
+        $artifact = @{ Signer = $null; Path = 'staged' }
+        $fixture = @{ Attempts = 0; Status = 'Incompatible'; ArtifactMatches = $true }
+        function Test-ArtifactFile { $fixture.ArtifactMatches }
+        function Get-ExtensionRelease { $asset }
+        function Get-VerifiedExtensionPackage { @{ Manifest = @{ manifest_version = 2; update_url = $script:UboUrl } } }
+        function Expand-BrowserPayload {
+            if (!$fixture.ArtifactMatches) { throw [NotSupportedException]::new('Payload mismatch.') }
+            @{ Exe = 'fixture.exe'; Files = @{ 'chrome.exe' = 'hash'; '158.0.8127.36\chrome.dll' = 'hash' } }
+        }
+        function Invoke-Mv2Fixture {
+            $fixture.Attempts++
+            if ($fixture.Status -eq 'Timeout') { throw [TimeoutException]::new() }
+            @{ Status = $fixture.Status; Detail = 'fixture' }
+        }
+        $cache = Join-Path $root 'mv2-pass.json'
+        Assert-Equal (Get-BrowserCompatibility $root $candidate $artifact $true).Status 'Incompatible'
+        Assert-Equal (Test-Path -LiteralPath $cache) $false
+        $fixture.Status = 'Timeout'
+        $result = Get-BrowserCompatibility $root $candidate $artifact $true
+        Assert-Equal $result.Status 'OperationalFailure'
+        Assert-Equal ($result.Detail -like '*timed out*') $true
+        Assert-Equal (Test-Path -LiteralPath $cache) $false
+        $fixture.ArtifactMatches = $false
+        Assert-Equal (Get-BrowserCompatibility $root $candidate $artifact $true).Status 'Inconclusive'
+        Assert-Equal $fixture.Attempts 2
+        $fixture.ArtifactMatches = $true
+        $fixture.Status = 'Pass'
+        foreach ($attempt in 1..2) {
+            $result = Get-BrowserCompatibility $root $candidate $artifact $true
+            Assert-Equal $result.Status 'Pass'
+            Assert-Equal $result.UboVersion $asset.Version
+        }
+        Assert-Equal $fixture.Attempts 3
+        $fixture.ArtifactMatches = $false
+        Assert-Equal (Get-BrowserCompatibility $root $candidate $artifact $true).Status 'OperationalFailure'
+        $fixture.ArtifactMatches = $true
+        $asset.Digest = 'd' * 64
+        Assert-Equal (Get-BrowserCompatibility $root $candidate $artifact $true).Status 'Pass'
+        $candidate.Digest = 'e' * 64
+        Assert-Equal (Get-BrowserCompatibility $root $candidate $artifact $true).Status 'Pass'
+        $oldCache = Read-Json $cache
+        $oldCache.Key = $oldCache.Key -replace '^1/', '0/'
+        Write-Json $cache $oldCache
+        Assert-Equal (Get-BrowserCompatibility $root $candidate $artifact $true).Status 'Pass'
+        Assert-Equal $fixture.Attempts 6
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $root 'mv2-work')) $false
     }
 
     Test-Case 'artifact checksum failure' {
@@ -231,7 +450,7 @@ try {
 
     Test-Case 'running browser defers installation and pending marker blocks retry' {
         $candidate = @{ Version = [version]'158.0.8127.36' }
-        $config = @{ browserApproval = @{ allowUnsigned = $true } }
+        $config = @{ browserTrust = @{ allowUnsigned = $true } }
         $artifact = @{ Signer = $null }
         function Test-BrowserBusy($Config) { $true }
         $installed = [version]'150.0.7871.186'
@@ -245,11 +464,12 @@ try {
     }
 
     Test-Case 'interrupted installer leaves a recovery marker and never launches a browser' {
-        $candidate = @{ Version = [version]'158.0.8127.36'; Tag = '158.0.8127.36-1.1' }
-        $config = @{ browserApproval = @{ allowUnsigned = $true } }
+        $candidate = @{ Version = [version]'158.0.8127.36'; Tag = '158.0.8127.36-1.1'; Digest = 'a' * 64 }
+        $config = @{ browserTrust = @{ allowUnsigned = $true }; browserPath = 'fixture'; architecture = 'x64' }
         $artifact = @{ Signer = $null; Path = (Join-Path $root 'absent-installer.exe') }
         function Test-BrowserBusy($Config) { $false }
         function Assert-RegisteredInstall($Config, $Version) { }
+        function Get-BrowserVersion { [version]'150.0.7871.186' }
         function New-BrowserBackup($Root, $Config, $Version) { 'fixture-backup' }
         function Test-ArtifactFile($Path, $Artifact) { $true }
         try { Install-BrowserCandidate $root $config ([version]'150.0.7871.186') $candidate $artifact | Out-Null }
@@ -257,6 +477,91 @@ try {
         $marker = Join-Path $root 'installation.json'
         Assert-Equal (Read-Json $marker).Backup 'fixture-backup'
         [IO.File]::Delete($marker)
+    }
+
+    Test-Case 'same-version install records a verified revision or blocks launch after a payload mismatch' {
+        $version = [version]'158.0.8127.36'
+        $candidate = @{ Version = $version; Tag = "$version-1.2"; Architecture = 'x64'; Revision = [version]'1.2'; Digest = 'b' * 64 }
+        $app = Join-Path $root 'fixture-app'
+        [void][IO.Directory]::CreateDirectory((Join-Path $app $version.ToString()))
+        $exe = Join-Path $app 'chrome.exe'
+        $dll = Join-Path $app "$version\chrome.dll"
+        [IO.File]::WriteAllText($exe, 'browser')
+        [IO.File]::WriteAllText((Join-Path $app 'chrome_proxy.exe'), 'proxy')
+        [IO.File]::WriteAllText($dll, 'before')
+        $config = @{ browserTrust = @{ allowUnsigned = $true }; browserPath = $exe; architecture = 'x64' }
+        $stateFile = Join-Path $root 'browser-release.json'
+        $previousRelease = @{ Tag = "$version-1.1"; Digest = 'a' * 64; Architecture = 'x64'
+            Identity = Get-InstalledBrowserIdentity $config $version }
+        Write-Json $stateFile $previousRelease
+        $compiled = Join-Path $root 'fixture-installer.exe'
+        $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+        $source = Join-Path $root 'InstallerFixture.cs'
+        [IO.File]::WriteAllText($source, @'
+using System.IO;
+public static class InstallerFixture {
+    public static void Main(string[] args) {
+        string root = Path.GetDirectoryName(args[1].Substring("--installerdata=".Length));
+        if (!File.Exists(Path.Combine(root, "installation.json"))) throw new IOException("Missing marker");
+        File.WriteAllText(Path.Combine(root, "fixture-app", "158.0.8127.36", "chrome.dll"), "after");
+    }
+}
+'@)
+        & $compiler /nologo /target:winexe "/out:$compiled" $source
+        if ($LASTEXITCODE -ne 0) { throw 'Cannot compile installer fixture.' }
+        $artifact = @{ Signer = $null; Path = $compiled }
+        function Get-BrowserVersion { [version]'158.0.8127.36' }
+        $busy = @{ Checks = 0; At = 3 }
+        function Test-BrowserBusy { $busy.Checks++; $busy.Checks -eq $busy.At }
+        function Assert-RegisteredInstall { }
+        function New-BrowserBackup { 'fixture-backup' }
+        function Remove-ExpiredBackups { }
+        function Test-ArtifactFile { $true }
+        $files = @{ "$version\chrome.dll" = [Convert]::ToHexString(
+            [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('after'))) }
+        $pending = Join-Path $root 'installation.json'
+        Assert-Equal (Install-BrowserCandidate $root $config $version $candidate $artifact $files) 'Deferred'
+        Assert-Equal ([IO.File]::ReadAllText($dll)) 'before'
+        Assert-Equal ([IO.File]::Exists($pending)) $false
+        $busy.At = 0
+        Assert-Equal (Install-BrowserCandidate $root $config $version $candidate $artifact $files) 'Installed'
+        Assert-Equal ([IO.File]::Exists($pending)) $false
+        Assert-Equal (Read-Json $stateFile).Tag $candidate.Tag
+        Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'Current'
+
+        [IO.File]::WriteAllText($dll, 'before')
+        Write-Json $stateFile $previousRelease
+        $config.userData = $root
+        $config.browserArgs = @()
+        $config.browserUpdateMode = 'Automatic'
+        $fixtureConfig = $config
+        $fixtureCandidate = $candidate
+        $fixtureArtifact = $artifact
+        $fixtureFiles = @{ "$version\chrome.dll" = '0' * 64 }
+        $calls = @{ Launch = 0; PayloadMismatch = $false }
+        $Force = $true
+        function Read-Config { $fixtureConfig }
+        function Get-WindowsCandidate { $fixtureCandidate }
+        function Get-UpstreamStable { $fixtureCandidate.Version }
+        function Get-ExtensionInventory { }
+        function Get-StoreUpdates { @{} }
+        function Get-BrowserArtifact { $fixtureArtifact }
+        function Get-BrowserCompatibility { @{ Status = 'Pass'; Detail = 'fixture'; Files = $fixtureFiles } }
+        function Write-Status($Level, $Message) {
+            if ($Message -like '*installed browser files do not match the verified installer payload*') { $calls.PayloadMismatch = $true }
+        }
+        function Start-Chromium { $calls.Launch++ }
+        Assert-Equal (Invoke-Launcher) 1
+        Assert-Equal ([IO.File]::ReadAllText($dll)) 'after'
+        Assert-Equal $calls.PayloadMismatch $true
+        Assert-Equal (Read-Json $pending).Tag $candidate.Tag
+        Assert-Equal (Read-Json $stateFile).Tag $previousRelease.Tag
+        Assert-Equal (Read-Json $stateFile).Digest $previousRelease.Digest
+        Assert-Equal (Read-Json $stateFile).Identity $previousRelease.Identity
+        Assert-Equal (Invoke-Launcher) 1
+        Assert-Equal $calls.Launch 0
+        [IO.File]::Delete($pending)
+        [IO.File]::Delete($stateFile)
     }
 
     Test-Case 'launch arguments preserve URL, quotes, empty strings and Unicode' {
@@ -316,6 +621,7 @@ exit 0
     Write-Output "$script:passed automated cases passed."
 } finally {
     Assert-OrdinaryTree $root
-    if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($root)) -ne (Get-UpdaterRoot)) { throw 'Unexpected test directory.' }
+    if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($root)) -ine [IO.Path]::GetFullPath($env:TEMP) -or
+        [IO.Path]::GetFileName($root) -cnotmatch '^uc-updater-tests-[a-f0-9]{32}$') { throw 'Unexpected test directory.' }
     Remove-Item -LiteralPath $root -Recurse -Force
 }
