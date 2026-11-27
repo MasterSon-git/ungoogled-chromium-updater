@@ -11,6 +11,30 @@ param(
 . (Join-Path $PSScriptRoot '../src/Browser.ps1')
 . (Join-Path $PSScriptRoot '../src/SelfUpdate.ps1')
 
+function Get-UpdaterTagNotes([string]$Repository, [string]$Tag) {
+    $ref = "refs/tags/$Tag"
+    $record = (git -C $Repository for-each-ref --count=1 '--format=%(refname)%00%(objecttype)%00%(contents)%00%(contents:signature)' $ref) -join "`n"
+    if ($LASTEXITCODE) { throw 'Could not read the release tag annotation.' }
+    $fields = $record.Split([char]0)
+    if ($fields.Count -ne 4 -or $fields[0] -cne $ref -or $fields[1] -cne 'tag') {
+        throw 'The selected release requires an annotated tag.'
+    }
+    $notes = $fields[2].TrimEnd("`r", "`n")
+    $signature = $fields[3].TrimEnd("`r", "`n")
+    if ($signature) {
+        if (!$notes.EndsWith($signature, [StringComparison]::Ordinal)) { throw 'Unexpected release tag signature format.' }
+        $notes = $notes.Substring(0, $notes.Length - $signature.Length).TrimEnd("`r", "`n")
+    }
+    if ([string]::IsNullOrWhiteSpace($notes)) { throw 'The selected release tag has no release notes.' }
+    $notes + "`n"
+}
+
+function Get-UpdaterReleaseCreateArguments([string]$Tag, [string]$Package, [string]$NotesFile, [bool]$Prerelease) {
+    'release', 'create', $Tag, $Package, "$Package.sig", '--verify-tag',
+        '--repo', "github.com/$script:UpdaterRepository", '--notes-file', $NotesFile
+    if ($Prerelease) { '--prerelease' }
+}
+
 function New-UpdaterPackage([string]$Source, [string]$Path, $Files = (Get-UpdaterPackageFiles)) {
     Assert-LocalPath $Path
     $stream = [IO.File]::Open($Path, 'CreateNew', 'ReadWrite', 'None')

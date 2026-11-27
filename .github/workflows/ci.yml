@@ -21,4 +21,4 @@ jobs:
           persist-credentials: false
       - name: Run static and isolated Windows checks
         shell: pwsh
-        run: ./tools/Test-Project.ps1
+        run: ./tools/Test-Project.ps1 -ReleaseCli

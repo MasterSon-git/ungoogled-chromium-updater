@@ -22,7 +22,10 @@ function Get-TaggedRelease([string]$Repository, [string]$Tag, [string]$EventRevi
     if ((Get-UpdaterVersion (Join-Path $Repository 'src/Updater.version')).Text -cne $version.Text) {
         throw 'The release tag does not match the updater version file.'
     }
-    @{ Tag = $Tag; Commit = $commit; Version = $version.Text; Prerelease = ($version.Pre.Count -gt 0) }
+    @{
+        Tag = $Tag; Commit = $commit; Version = $version.Text; Prerelease = ($version.Pre.Count -gt 0)
+        Notes = Get-UpdaterTagNotes $Repository $Tag
+    }
 }
 
 if ($MyInvocation.InvocationName -eq '.') { return }
@@ -42,7 +45,7 @@ $output = Join-Path $repo 'release-out'
 $unsigned = Join-Path $output 'unsigned'
 $package = Join-Path $unsigned $script:UpdaterPackageName
 if ($Phase -eq 'Build') {
-    & (Join-Path $PSScriptRoot 'Test-Project.ps1')
+    & (Join-Path $PSScriptRoot 'Test-Project.ps1') -ReleaseCli
     $repeat = Join-Path $output 'repeat'
     & (Join-Path $PSScriptRoot 'Release.ps1') -Commit $release.Commit -OutputDirectory $unsigned
     & (Join-Path $PSScriptRoot 'Release.ps1') -Commit $release.Commit -OutputDirectory $repeat
@@ -79,11 +82,13 @@ if ($Phase -eq 'Sign') {
 Assert-LocalPath $signature
 [IO.File]::Copy($signature, "$package.sig")
 Test-UpdaterReleasePackage $package $release.Version $verified $publicKey
-$options = @('--verify-tag','--notes-from-tag','--repo',$script:UpdaterRepository)
-if ($release.Prerelease) { $options += '--prerelease' }
-gh release create $release.Tag $package "$package.sig" @options
+$notesPath = Join-Path $output 'release-notes.md'
+Assert-LocalPath $notesPath
+[IO.File]::WriteAllText($notesPath, $release.Notes)
+$createArguments = Get-UpdaterReleaseCreateArguments $release.Tag $package $notesPath $release.Prerelease
+gh @createArguments
 if ($LASTEXITCODE) { throw 'GitHub release publication failed. Inspect the release before retrying.' }
-$immutable = gh api "repos/$script:UpdaterRepository/releases/tags/$($release.Tag)" --jq '.immutable'
+$immutable = gh api "repos/$script:UpdaterRepository/releases/tags/$($release.Tag)" --hostname github.com --jq '.immutable'
 if ($LASTEXITCODE -or $immutable -cne 'true') {
     throw 'The release was published, but GitHub did not confirm immutability. Inspect the release before validation or retry.'
 }
