@@ -1,4 +1,14 @@
-# Browser maintenance and recovery
+# Updater and browser maintenance
+
+## Updater maintenance and recovery
+
+An existing configuration without updater settings uses Stable and enabled self-updates. Setup and self-updates preserve existing browser and extension settings. Existing installations that predate the self-update launcher need one manual `Setup.ps1 -Install` from a reviewed checkout or a verified package.
+
+The updater checks for a release before browser and extension checks on an eligible launch. A download, signature, or probe failure keeps the current worker active and allows the browser check to continue. Activation uses `updater-active.json` to select a verified worker in `updater-a` or `updater-b`. The previous worker stays on disk. An interrupted attempt before activation leaves the current worker selected. A later attempt replaces abandoned staging data.
+
+If the launcher reports a damaged installation, let any updater checks finish and run `Setup.ps1 -Install` again from a trusted checkout or verified release of the intended version. A manual install resets the activation record and replaces the fixed launcher and its base worker. Review the version before deliberately reverting because an older version can restore an older signing pin. To reinstall from a downloaded updater release, verify the ZIP and its `.sig` using the release tool from a checkout with the independently trusted key, extract it into a new local directory and run its `Setup.ps1 -Install`. [Release verification](releases.md#verify-and-reinstall)
+
+A pending `installation.json` still requires the browser recovery procedure below after an updater reinstall. Leave private configuration, backups and recovery records in place. To pause updater downloads while investigating a release, set `"selfUpdateEnabled": false` in `config.json` while the updater is idle.
 
 ## Browser update policy
 
@@ -37,7 +47,10 @@ All paths below are under `%LOCALAPPDATA%\UngoogledChromiumUpdater`.
 
 | Path | Contents |
 | --- | --- |
-| `app` | Installed launcher and scripts |
+| `app` | Fixed shortcut launcher, entry scripts and manually installed base worker |
+| `updater-active.json` | Atomically selected updater slot and version |
+| `updater-a`, `updater-b` | Alternating updater worker directories |
+| `updater-work` | Temporary updater package and extraction workspace |
 | `config.json` | Private browser and extension source configuration |
 | `config.legacy.json` | Original private configuration retained during migration |
 | `state.json` | Daily status and installed extension version and manifest permission baselines |

@@ -6,10 +6,13 @@ Run the automated logic tests in PowerShell 7.5 or newer.
 
 ```powershell
 .\tests\Test-Updater.ps1
+.\tests\Test-SelfUpdate.ps1
 git diff --check
 ```
 
 The suite uses controlled data and a private temporary directory. It includes legacy release evidence checks and an installer fixture that exits successfully with a payload mismatch. The launcher must retain recovery, keep the previous release record, and block browser launch in that case. Use `Update.ps1 -CheckOnly -VerifyCurrent` for a read-only check against the installed browser and live sources. Document which network and runtime paths you exercised.
+
+The self-update suite uses a temporary signing key, actual release ZIPs, an isolated Setup installation, and the compiled Windows launcher. It supplies fixture responses at the network boundary and launches a small argument recorder. It checks Stable, Staging, disabled updates, activation failures and recovery without using the installed browser or its profile. See [release procedures](docs/releases.md) for building a selected review commit and validating a staging release.
 
 For the integrated Windows gate, maintain a current, trusted installation of [official 7-Zip](https://www.7-zip.org/download.html) in Program Files and run `Update.ps1 -Stage -TestCompatibility` with a configured updater. The command reports the 7-Zip version, stages the verified installer, and exercises its embedded browser payload and the latest verified stable full uBlock Origin CRX. It leaves the installed browser and production profile untouched. Check the tested-version scope, workspace cleanup, and the cached-pass message on a second run. A pending patch gap or revision can still yield exit code 2 after a compatibility Pass. For a fresh run, remove `mv2-pass.json` while the updater is idle. Increment the test version in `src/Mv2.ps1` when changes affect the evidence a cached result represents.
 

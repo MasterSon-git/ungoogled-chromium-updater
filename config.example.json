@@ -3,6 +3,8 @@
   "userData": "%LOCALAPPDATA%\\Chromium\\User Data",
   "browserArgs": [],
   "architecture": "x64",
+  "selfUpdateEnabled": true,
+  "updaterChannel": "Stable",
   "browserUpdateMode": "Automatic",
   "browserTrust": {
     "allowUnsigned": true,

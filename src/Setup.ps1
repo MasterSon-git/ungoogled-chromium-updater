@@ -2,6 +2,7 @@
 [CmdletBinding(DefaultParameterSetName = 'Install')]
 param(
     [Parameter(ParameterSetName = 'Install')][switch]$Install,
+    [Parameter(ParameterSetName = 'Install')][guid]$TestInstall,
     [Parameter(Mandatory, ParameterSetName = 'Integrate')][switch]$Integrate,
     [Parameter(Mandatory, ParameterSetName = 'Uninstall')][switch]$Uninstall
 )
@@ -9,6 +10,7 @@ param(
 . (Join-Path $PSScriptRoot 'Common.ps1')
 . (Join-Path $PSScriptRoot 'Browser.ps1')
 . (Join-Path $PSScriptRoot 'BrowserPayload.ps1')
+. (Join-Path $PSScriptRoot 'SelfUpdate.ps1')
 
 function Write-Status([string]$Level, [string]$Message) {
     Write-Host "[$Level] $Message"
@@ -28,28 +30,51 @@ function Install-LauncherFiles([string]$Root) {
         $compiler = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
     }
     $app = Join-Path $Root 'app'
+    $active = Join-Path $Root 'updater-active.json'
     $staged = Join-Path $Root ('app-staged-' + [guid]::NewGuid().ToString('N'))
     $previous = Join-Path $Root ('app-previous-' + [guid]::NewGuid().ToString('N'))
     Assert-LocalPath $app
-    [void][IO.Directory]::CreateDirectory($staged)
-    foreach ($name in 'Update.ps1','Common.ps1','Extensions.ps1','Browser.ps1','BrowserPayload.ps1','Mv2.ps1','Crx3.cs','Setup.ps1') {
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $staged $name)
-    }
-    $launcher = Join-Path $staged 'ChromiumUpdater.exe'
-    & $compiler '/nologo' '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Web.Extensions.dll' "/out:$launcher" (Join-Path $PSScriptRoot 'Launcher.cs')
-    if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $launcher)) { throw 'Windows launcher compilation failed.' }
-    [IO.File]::WriteAllText((Join-Path $staged 'pwsh.path'), $shell)
+    Assert-LocalPath $active
     $config = Join-Path $Root 'config.json'
     Assert-LocalPath $config
-    if (!(Test-Path -LiteralPath $config)) {
-        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../config.example.json') -Destination $config
-    }
-    $hadApp = Test-Path -LiteralPath $app
-    if ($hadApp) { [IO.Directory]::Move($app, $previous) }
-    try { [IO.Directory]::Move($staged, $app) }
-    catch {
-        if ($hadApp) { [IO.Directory]::Move($previous, $app) }
-        throw
+    try {
+        [void][IO.Directory]::CreateDirectory($staged)
+        foreach ($name in (Get-UpdaterPackageFiles).Keys) {
+            $source = Join-Path $PSScriptRoot $name
+            if ($name -in 'config.example.json','LICENSE','THIRD_PARTY_NOTICES.md' -and ![IO.File]::Exists($source)) {
+                $source = Join-Path $PSScriptRoot "../$name"
+            }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $staged $name)
+        }
+        $launcher = Join-Path $staged 'ChromiumUpdater.exe'
+        & $compiler '/nologo' '/target:winexe' '/reference:System.Windows.Forms.dll' '/reference:System.Web.Extensions.dll' "/out:$launcher" (Join-Path $staged 'Launcher.cs')
+        if ($LASTEXITCODE -ne 0 -or !(Test-Path -LiteralPath $launcher)) { throw 'Windows launcher compilation failed.' }
+        [IO.File]::WriteAllText((Join-Path $staged 'pwsh.path'), $shell)
+        Assert-UpdaterWorker $staged $shell
+        if (!(Test-Path -LiteralPath $config)) {
+            $example = Join-Path $staged 'config.example.json'
+            if ($TestInstall -eq [guid]::Empty) {
+                Copy-Item -LiteralPath $example -Destination $config
+            } else {
+                $isolated = Read-Json $example
+                $isolated.browserPath = Join-Path $Root 'fixture\chrome.exe'
+                $isolated.userData = Join-Path $Root 'fixture-profile'
+                $isolated.browserUpdateMode = 'Manual'
+                $isolated.browserTrust.allowUnsigned = $false
+                $isolated.selfUpdateEnabled = $false
+                Write-Json $config $isolated
+            }
+        }
+        $hadApp = Test-Path -LiteralPath $app
+        if ($hadApp) { [IO.Directory]::Move($app, $previous) }
+        try { [IO.Directory]::Move($staged, $app) }
+        catch {
+            if ($hadApp) { [IO.Directory]::Move($previous, $app) }
+            throw
+        }
+        [IO.File]::Delete($active)
+    } finally {
+        if (Test-Path -LiteralPath $staged) { Remove-LauncherDirectory $Root $staged }
     }
     if ($hadApp) { Remove-LauncherDirectory $Root $previous }
     $settings = Read-Json $config
@@ -67,7 +92,7 @@ function Install-LauncherFiles([string]$Root) {
             Write-Status WARN 'The installed Windows packaging revision remains unknown.'
         }
     }
-    Write-Host '[ OK ] Launcher installed under Local AppData. Configure it before integrating shortcuts.'
+    Write-Host '[ OK ] Launcher installed under Local AppData.'
 }
 
 function Remove-LauncherDirectory([string]$Root, [string]$Path) {
@@ -157,7 +182,12 @@ function Set-LauncherShortcuts([string]$Root, [bool]$Restore) {
     }
 }
 
-$root = if ($Uninstall) { Get-UpdaterRoot } else { New-PrivateRoot }
+if ($PSBoundParameters.ContainsKey('TestInstall') -and $TestInstall -eq [guid]::Empty) {
+    throw 'Provide a non-empty test installation ID.'
+}
+$root = if ($Uninstall) { Get-UpdaterRoot }
+elseif ($TestInstall -ne [guid]::Empty) { New-PrivateRoot ("$(Get-UpdaterRoot)-Test-$($TestInstall.ToString('N'))") }
+else { New-PrivateRoot }
 Assert-PrivateRoot $root
 $guard = Enter-UpdateLock $root 20
 if (!$guard) { throw 'A launcher operation is in progress. Retry after it finishes.' }
@@ -167,6 +197,10 @@ try {
         Set-LauncherShortcuts $root $true
         $app = Join-Path $root 'app'
         if (Test-Path -LiteralPath $app) { Remove-LauncherDirectory $root $app }
+        $active = Join-Path $root 'updater-active.json'
+        Assert-LocalPath $active
+        [IO.File]::Delete($active)
+        foreach ($name in 'updater-work','updater-a','updater-b') { Remove-UpdaterDirectory $root $name }
         Write-Host '[ OK ] Launcher removed. Private configuration, logs and backups remain available for recovery.'
     } else { Install-LauncherFiles $root }
 } finally { $guard.Dispose() }

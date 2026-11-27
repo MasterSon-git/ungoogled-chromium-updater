@@ -10,10 +10,13 @@
 !src/
 !src/*.ps1
 !src/*.cs
+!src/Updater.version
 !tests/
 !tests/*.ps1
 !docs/
 !docs/*.md
+!tools/
+!tools/Release.ps1
 
 # Keep generated and private files out even inside these directories.
 *.local.*
