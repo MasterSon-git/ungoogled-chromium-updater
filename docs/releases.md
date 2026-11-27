@@ -17,7 +17,7 @@ GitHub Releases is the only client distribution source. Anonymous delivery requi
 
 ## Bootstrap signing
 
-Perform these steps only after separate approval for production bootstrap. The implementation ships with an empty public pin.
+The reviewed `0.1.0` bootstrap at `65285a9` contains the production public pin. Use the following provisioning steps for a new key only after separate maintainer approval.
 
 1. On a trusted Windows workstation, generate an RSA key with 3072 or 4096 bits. Use PowerShell and .NET's `RSA.Create(3072)` or `RSA.Create(4096)`. Obtain the SubjectPublicKeyInfo PEM with `ExportSubjectPublicKeyInfoPem()` and record the SHA-256 of the DER bytes from `ExportSubjectPublicKeyInfo()` through a trusted administrative channel.
 2. Add only the public PEM to `src/ReleaseTrust.ps1` in a reviewed PR. Compare its DER SHA-256 against the recorded fingerprint independently of the GitHub upload. A second human review is welcome when available. The maintainer can compare a fresh export from the same key and verify a local signing challenge before discarding the private bytes.
@@ -62,6 +62,12 @@ For planned rotation, publish a higher bridge version with the new public pin in
 The ZIP contains reviewed updater scripts and C# source, sample configuration, applicable notices and a generated manifest. Setup and self-update compile the launcher locally using the Windows .NET Framework compiler. Reproducibility covers the distributed ZIP. The builder uses Git objects and fixed ZIP ordering and timestamps. Signatures use RSA PKCS#1 v1.5 with SHA-256 over five ASCII lines with LF terminators, including the format identifier `Ungoogled Chromium Updater package v1`, repository `MasterSon-git/ungoogled-chromium-updater`, tag, decimal ZIP byte count, and lowercase ZIP SHA-256.
 
 The v1 manifest declares the complete flat payload. New versions may add bounded, individually named script, C# source, JSON, Markdown or text files. Keep the v1 core files and entry-point contracts while older clients depend on them. For a new archive or signature format, first release a v1 bridge that can consume both formats. Verify the bridge on an older installation and provide the trusted manual upgrade path for clients that skip it.
+
+## First signed staging validation
+
+Use the reviewed `0.1.0` checkout at `65285a9` for the isolated baseline and verify its installed public pin against the reviewed DER fingerprint. Keep browser installation in Manual mode with a local argument recorder and a disposable profile. Once the reviewed `0.1.1-rc.1` commit is on `main` and the maintainer authorizes the tag and publication, use the release workflow above.
+
+After publication, verify that the anonymous release API reports an immutable prerelease with the expected tag and both signed package assets. Run an eligible launch from the isolated baseline in Staging mode. Record that `app\Updater.version` and the selected slot both report `0.1.1-rc.1`, the updater outcome is `Applied`, and the recorder received the original arguments. The isolated installation provides the evidence for issue #8 before production activation.
 
 ## Verify and reinstall
 
