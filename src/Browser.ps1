@@ -15,15 +15,21 @@ function Get-BrowserVersion([string]$Path, [string]$Architecture) {
     Get-Version $file.VersionInfo.ProductVersion
 }
 
-function Get-WindowsCandidate([string]$Architecture) {
-    $release = Get-StableRelease $script:WindowsRepo
-    if ($release.tag_name -cnotmatch '^(\d+\.\d+\.\d+\.\d+)-\d+(?:\.\d+)?$') {
+function Convert-WindowsTag([string]$Tag) {
+    if ($Tag -cnotmatch '^(\d+\.\d+\.\d+\.\d+)-([1-9]\d{0,5})(?:\.([1-9]\d{0,5}))?$') {
         throw 'Unexpected stable Windows release tag.'
     }
-    $version = Get-Version $Matches[1]
+    @{ Version = Get-Version $Matches[1]; Revision = [version]::new([int]$Matches[2], [int]($Matches[3] ?? 0)) }
+}
+
+function Get-WindowsCandidate([string]$Architecture) {
+    $release = Get-StableRelease $script:WindowsRepo
+    $tag = Convert-WindowsTag $release.tag_name
     $asset = Get-ReleaseAsset $release $script:WindowsRepo "ungoogled-chromium_$($release.tag_name)_installer_$Architecture.exe"
-    $asset.Version = $version
+    $asset.Version = $tag.Version
+    $asset.Revision = $tag.Revision
     $asset.Tag = $release.tag_name
+    $asset.Architecture = $Architecture
     $asset
 }
 
@@ -51,14 +57,53 @@ function Test-BrowserBusy($Config) {
     $false
 }
 
-function Test-BrowserApproval($Approval, $Candidate, [version]$Stable, [bool]$HasMv2) {
-    if ($Approval -isnot [Collections.IDictionary] -or $Approval['tag'] -cne $Candidate.Tag -or
-        $Approval['sha256'] -ine $Candidate.Digest) { return $false }
-    if ($HasMv2 -and ($Approval['mv2RuntimeVerified'] -isnot [bool] -or !$Approval['mv2RuntimeVerified'])) { return $false }
-    if ($Candidate.Version -lt $Stable -and
-        (!$Approval['acceptedStableVersion'] -or (Get-Version $Approval['acceptedStableVersion']) -lt $Stable)) { return $false }
-    if ($Approval['allowUnsigned'] -isnot [bool]) { return $false }
-    $true
+function Test-BrowserApproval($Approval, $Candidate) {
+    $Approval -is [Collections.IDictionary] -and $Approval['tag'] -ceq $Candidate.Tag -and
+        $Approval['sha256'] -ieq $Candidate.Digest
+}
+
+function Assert-BrowserTrust($Trust, $Artifact) {
+    if ($Artifact.Signer) {
+        if ($Trust['signerSha256'] -ine $Artifact.Signer) { throw 'The Windows installer signer does not match the configured pin.' }
+    } elseif ($Trust['allowUnsigned'] -ne $true -or $Trust['signerSha256']) {
+        throw 'The standing browser policy does not accept this unsigned installer.'
+    }
+}
+
+function Get-InstalledBrowserIdentity($Config, [version]$Version) {
+    $app = [IO.Path]::GetDirectoryName($Config.browserPath)
+    $versionDirectory = Join-Path $app $Version.ToString()
+    Assert-OrdinaryTree $versionDirectory
+    [string[]]$files = @($Config.browserPath, (Join-Path $app 'chrome_proxy.exe')) +
+        @(Get-ChildItem -LiteralPath $versionDirectory -File -Recurse -Force | ForEach-Object FullName)
+    [Array]::Sort($files, [StringComparer]::Ordinal)
+    $contents = foreach ($file in $files) {
+        Assert-LocalPath $file
+        $relative = [IO.Path]::GetRelativePath($app, $file)
+        "$relative=$((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash)"
+    }
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($contents -join "`n")))
+}
+
+function Get-BrowserReleaseStatus([string]$Root, $Config, [version]$Installed, $Candidate) {
+    if ($Candidate.Version -gt $Installed) { return 'Newer' }
+    if ($Candidate.Version -lt $Installed) { return 'Older' }
+    $path = Join-Path $Root 'browser-release.json'
+    Assert-LocalPath $path
+    if (![IO.File]::Exists($path)) { return 'UnknownRevision' }
+    try {
+        $record = Read-Json $path
+        $tag = Convert-WindowsTag $record['Tag']
+        if ($tag.Version -ne $Installed -or $record['Architecture'] -cne $Config.architecture -or
+            $record['Digest'] -cnotmatch '^[a-fA-F0-9]{64}$' -or $record['Identity'] -cnotmatch '^[a-fA-F0-9]{64}$' -or
+            $record['Identity'] -cne (Get-InstalledBrowserIdentity $Config $Installed)) {
+            return 'UnknownRevision'
+        }
+    } catch { return 'UnknownRevision' }
+    if ($Candidate.Revision -gt $tag.Revision) { return 'Newer' }
+    if ($Candidate.Revision -lt $tag.Revision) { return 'Older' }
+    if ($Candidate.Tag -cne $record.Tag -or $Candidate.Digest -ine $record.Digest) { return 'ChangedRelease' }
+    'Current'
 }
 
 function Test-ArtifactFile([string]$Path, $Artifact) {
@@ -86,6 +131,9 @@ function Get-BrowserArtifact([string]$Root, $Candidate) {
         } finally { [IO.File]::Delete($temp) }
     }
     Write-Status ' OK ' 'Windows installer matches the published SHA-256 and byte count.'
+    if ((Get-BrowserVersion $file $Candidate.Architecture) -ne $Candidate.Version) {
+        throw 'The Windows installer version differs from the release tag.'
+    }
     $signature = Get-AuthenticodeSignature -LiteralPath $file
     if ($signature.Status -notin 'Valid','NotSigned') { throw 'Windows installer has an invalid Authenticode status.' }
     $signer = if ($signature.Status -eq 'Valid') {
@@ -176,22 +224,29 @@ function Assert-RegisteredInstall($Config, [version]$Version) {
     Assert-LocalPath $setup
 }
 
-function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $Candidate, $Artifact) {
-    $approval = $Config.browserApproval
-    if ($Artifact.Signer) {
-        if ($approval['signerSha256'] -ine $Artifact.Signer) { throw 'The Windows installer signer does not match the approved pin.' }
-    } elseif (!$approval['allowUnsigned']) { throw 'This unsigned Windows installer lacks explicit approval.' }
+function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $Candidate, $Artifact, $Payload) {
+    Assert-BrowserTrust $Config.browserTrust $Artifact
     if (Test-BrowserBusy $Config) { return 'Deferred' }
     Assert-RegisteredInstall $Config $Installed
     $pending = Join-Path $Root 'installation.json'
     Assert-LocalPath $pending
     if (Test-Path -LiteralPath $pending) { throw 'An interrupted installation requires recovery.' }
+    if ((Get-BrowserVersion $Config.browserPath $Config.architecture) -ne $Installed -or
+        (Get-BrowserReleaseStatus $Root $Config $Installed $Candidate) -ne 'Newer') {
+        throw 'The installed browser changed before the update.'
+    }
+    if ($Installed -eq $Candidate.Version -and !$Payload) { throw 'Cannot verify a same-version installer payload.' }
     $backup = New-BrowserBackup $Root $Config $Installed
     if (!(Test-ArtifactFile $Artifact.Path $Candidate)) { throw 'The staged installer changed after verification.' }
     if (Test-BrowserBusy $Config) { return 'Deferred' }
+    if ((Get-BrowserVersion $Config.browserPath $Config.architecture) -ne $Installed -or
+        ($Installed -eq $Candidate.Version -and (Get-BrowserReleaseStatus $Root $Config $Installed $Candidate) -ne 'Newer')) {
+        throw 'The installed browser changed during backup.'
+    }
     $installPreferences = Join-Path $Root 'installer-preferences.json'
     Write-Json $installPreferences @{ distribution = @{ do_not_create_any_shortcuts = $true } }
-    Write-Json $pending @{ Previous = $Installed.ToString(); Candidate = $Candidate.Version.ToString(); Tag = $Candidate.Tag; Backup = $backup }
+    Write-Json $pending @{ Previous = $Installed.ToString(); Candidate = $Candidate.Version.ToString()
+        Tag = $Candidate.Tag; Digest = $Candidate.Digest; Backup = $backup }
     if (Test-BrowserBusy $Config) {
         [IO.File]::Delete($pending)
         [IO.File]::Delete($installPreferences)
@@ -212,6 +267,13 @@ function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $
         throw 'The installed browser version did not match the verified candidate.'
     }
     Assert-RegisteredInstall $Config $Candidate.Version
+    if ($Payload -and !(Test-BrowserPayload ([IO.Path]::GetDirectoryName($Config.browserPath)) $Payload)) {
+        throw 'The installed browser files do not match the verified installer payload.'
+    }
+    Write-Json (Join-Path $Root 'browser-release.json') @{
+        Tag = $Candidate.Tag; Digest = $Candidate.Digest; Architecture = $Candidate.Architecture
+        Identity = Get-InstalledBrowserIdentity $Config $Candidate.Version
+    }
     [IO.File]::Delete($pending)
     [IO.File]::Delete($installPreferences)
     try { Remove-ExpiredBackups $Root $backup } catch { Write-Status WARN 'Backup retention needs manual attention.' }

@@ -3,7 +3,11 @@
   "userData": "%LOCALAPPDATA%\\Chromium\\User Data",
   "browserArgs": [],
   "architecture": "x64",
-  "installOnLaunch": false,
+  "browserUpdateMode": "Automatic",
+  "browserTrust": {
+    "allowUnsigned": true,
+    "signerSha256": null
+  },
   "browserApproval": null,
   "extensions": {}
 }
