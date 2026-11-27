@@ -10,6 +10,8 @@ A download, signature, or probe failure keeps the current app and worker active 
 
 If the launcher reports a damaged installation or the shortcut target is missing after an interruption, let updater operations finish and run `Setup.ps1 -Install` from a trusted checkout or verified release of the intended version. A manual install resets the selector and replaces the fixed launcher and its base worker. Review the version before deliberately reverting because an older version can restore an older signing pin. For a downloaded release, verify the ZIP and its `.sig` using the release tool with the independently trusted public pin, extract into a new local directory and invoke Setup there. [Release verification](releases.md#verify-and-reinstall)
 
+A hard interruption between the two app directory renames can leave `app` missing, the prior installation in `updater-previous-app`, and the candidate in `updater-work\next-app`. Preserve the prior app and use the verified manual installation procedure to restore the shortcut target. The Windows test suite exercises this interruption and checks the prior app, configuration and pending browser recovery marker through recovery.
+
 A pending `installation.json` still requires the browser recovery procedure below after an updater reinstall. Leave private configuration, backups and recovery records in place. To pause updater downloads while investigating a release, set `"selfUpdateEnabled": false` in `config.json` while the updater is idle.
 
 ## Browser update policy

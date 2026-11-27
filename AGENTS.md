@@ -13,5 +13,5 @@
 - Check the source and terms of third-party material before including it. Preserve required notices and record provenance in THIRD_PARTY_NOTICES.md.
 - Review the exact staged files for private material. Keep publication assessments in private storage.
 - Follow the reviewed-tag and protected environment procedures in [docs/releases.md](docs/releases.md). Release tags, signing secrets, publication, public visibility changes, and production self-update activation require maintainer approval.
-- Validate launcher self-updates in a separate test installation with test-only trust and data. Keep production shortcuts, configuration, and profile untouched.
+- Validate launcher self-updates in a separate installation with test data. Use test-only keys for fixture releases and the approved public pin for authorized live staging validation. Keep production shortcuts, configuration, and profile untouched.
 - Write project materials in English and use ASCII where practical. Report failures, unverified behavior and unresolved security concerns.

@@ -73,6 +73,39 @@ function Start-FixtureLauncher([string]$ExpectedUpdaterStatus = 'Current') {
     } finally { $front.Dispose() }
 }
 
+function Invoke-InterruptedFixtureHandoff([ValidateSet('before-renames','between-renames')][string]$Point) {
+    $signal = Join-Path $feed 'interrupt'
+    $evidence = Join-Path $feed 'interrupted'
+    [IO.File]::Delete($evidence)
+    [IO.File]::Delete($argumentsFile)
+    [IO.File]::WriteAllText($signal, $Point)
+    try {
+        & ([Environment]::ProcessPath) -NoProfile -File $update -Force -Interactive
+        Assert-Equal $LASTEXITCODE 20
+        $deadline = [DateTime]::UtcNow.AddSeconds(30)
+        while (![IO.File]::Exists($evidence) -and [DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Milliseconds 100
+        }
+        if (![IO.File]::Exists($evidence)) { throw "The handoff did not reach $Point." }
+        $plan = Read-Json (Join-Path $root 'updater-work/handoff.json')
+        $helper = Get-UpdaterProcess $plan.ProcessId $plan.StartTicks
+        if ($helper) {
+            try {
+                if (!$helper.WaitForExit(10000)) { throw 'The interrupted handoff did not exit.' }
+                Assert-Equal $helper.ExitCode 88
+            } finally { $helper.Dispose() }
+        }
+        Assert-Equal ([IO.File]::Exists($argumentsFile)) $false
+    } finally { [IO.File]::Delete($signal) }
+}
+
+function Get-FixtureAppSnapshot([string]$Directory) {
+    $entries = foreach ($file in (Get-ChildItem -LiteralPath $Directory -File -Force | Sort-Object Name)) {
+        "$($file.Name)=$((Get-FileHash -LiteralPath $file.FullName).Hash)"
+    }
+    $entries -join "`n"
+}
+
 function Remove-TestDirectory([string]$Path, [string]$Expected) {
     if ($Path -ine [IO.Path]::GetFullPath($Expected)) { throw 'Unexpected self-update test directory.' }
     if (![IO.Directory]::Exists($Path)) { return }
@@ -136,11 +169,23 @@ function Invoke-TrustedGet {
     $handoffFile = Join-Path $src 'Handoff.ps1'
     $handoff = [IO.File]::ReadAllText($handoffFile)
     $interruptedHandoff = $handoff.Replace('        Remove-UpdaterDirectory $Root ''updater-previous-app''', @'
-        if ([IO.File]::Exists((Join-Path $Root 'fixture-feed/interrupt'))) {
-            [IO.File]::WriteAllText((Join-Path $Root 'fixture-feed/interrupted'), "$PID")
+        $fixture = Join-Path $Root 'fixture-feed'
+        $signal = Join-Path $fixture 'interrupt'
+        $point = if ([IO.File]::Exists($signal)) { [IO.File]::ReadAllText($signal) }
+        if ($point -ceq 'before-renames') {
+            [IO.File]::WriteAllText((Join-Path $fixture 'interrupted'), $point)
             [Environment]::Exit(88)
         }
         Remove-UpdaterDirectory $Root 'updater-previous-app'
+'@).Replace('        [IO.Directory]::Move($app, $previous)', @'
+        if ($point -ceq 'between-renames') {
+            [IO.File]::Copy((Join-Path $fixture 'pending-browser-recovery.json'), (Join-Path $Root 'installation.json'))
+        }
+        [IO.Directory]::Move($app, $previous)
+        if ($point -ceq 'between-renames') {
+            [IO.File]::WriteAllText((Join-Path $fixture 'interrupted'), $point)
+            [Environment]::Exit(88)
+        }
 '@)
     $bootstrapFile = Join-Path $src 'Update.ps1'
     $bootstrap = [IO.File]::ReadAllText($bootstrapFile).Replace("[void](Read-Host 'Press Enter to close this window')", 'Start-Sleep -Milliseconds 1500')
@@ -371,23 +416,13 @@ internal static class Recorder {
     Assert-Equal (Get-FileHash -LiteralPath $configPath).Hash $configBefore
     Write-Output 'PASS Windows EXE launcher across Stable, Staging, disabled and subsequent stable releases with exact launch arguments'
 
-    # Exit the isolated worker after the new slot is in place and before it commits the activation record.
+    # Exit the handoff after staging the new slot and before either app directory rename.
     $update = Join-Path $root 'app/Update.ps1'
-    $interrupt = Join-Path $feed 'interrupt'
     Publish-FixtureFeed $packages['0.2.1'] $releases['0.2.1']
-    [IO.File]::WriteAllText($interrupt, 'interrupt')
-    [IO.File]::Delete($argumentsFile)
-    & ([Environment]::ProcessPath) -NoProfile -File $update -Force -Interactive
-    Assert-Equal $LASTEXITCODE 20
-    $deadline = [DateTime]::UtcNow.AddSeconds(30)
-    $interrupted = Join-Path $feed 'interrupted'
-    while (![IO.File]::Exists($interrupted) -and [DateTime]::UtcNow -lt $deadline) { Start-Sleep -Milliseconds 100 }
-    if (![IO.File]::Exists($interrupted)) { throw 'The interrupted handoff did not reach the expected fault.' }
-    Assert-Equal ([IO.File]::Exists($argumentsFile)) $false
+    Invoke-InterruptedFixtureHandoff 'before-renames'
     Assert-Equal (Read-Json $activePath).Version '0.2.0'
     Assert-Equal (Get-UpdaterVersion (Join-Path $root 'updater-a/Updater.version')).Text '0.2.1'
     Assert-Equal ([IO.Directory]::Exists((Join-Path $root 'updater-work'))) $true
-    [IO.File]::Delete($interrupt)
     [IO.File]::Delete((Join-Path $feed 'releases.json'))
     Start-FixtureLauncher 'Failed'
     Assert-Equal (Get-Content -LiteralPath (Join-Path $feed 'new-launcher.txt') -Raw) 'new launcher'
@@ -424,6 +459,39 @@ internal static class Recorder {
     Publish-FixtureFeed $zip $stable
     Start-FixtureLauncher
     Assert-Equal (Get-UpdaterSlot $root).Slot 'app'
+
+    # A hard exit here leaves the fixed shortcut target missing and the full prior app retained.
+    $app = Join-Path $root 'app'
+    $previous = Join-Path $root 'updater-previous-app'
+    $snapshot = Get-FixtureAppSnapshot $app
+    $markerFixture = Join-Path $feed 'pending-browser-recovery.json'
+    Write-Json $markerFixture @{ Interrupted = $true; Backup = 'fixture-before-browser-install' }
+    $markerHash = (Get-FileHash -LiteralPath $markerFixture).Hash
+    Publish-FixtureFeed $packages['0.2.1'] $releases['0.2.1']
+    Invoke-InterruptedFixtureHandoff 'between-renames'
+    Assert-Equal ([IO.Directory]::Exists($app)) $false
+    Assert-Equal (Get-FixtureAppSnapshot $previous) $snapshot
+    Assert-Equal (Get-UpdaterVersion (Join-Path $root 'updater-work/next-app/Updater.version')).Text '0.2.1'
+    Assert-Equal (Get-FileHash -LiteralPath $marker).Hash $markerHash
+    Assert-Equal (Get-FileHash -LiteralPath $configPath).Hash $configBefore
+
+    & (Join-Path $recovery 'Setup.ps1') -Install -TestInstall $id
+    Assert-Equal (Get-UpdaterSlot $root).Slot 'app'
+    Assert-Equal (Get-UpdaterVersion (Join-Path $app 'Updater.version')).Text '0.2.0'
+    Assert-Equal (Get-FixtureAppSnapshot $previous) $snapshot
+    Assert-Equal (Get-FileHash -LiteralPath $configPath).Hash $configBefore
+    Assert-Equal (Get-FileHash -LiteralPath $marker).Hash $markerHash
+    [IO.File]::Delete($requestLog)
+    & ([Environment]::ProcessPath) -NoProfile -NonInteractive -File $update -Force
+    Assert-Equal $LASTEXITCODE 1
+    Assert-Equal ([IO.File]::Exists($argumentsFile)) $false
+    Assert-Equal ([IO.File]::Exists($requestLog)) $false
+    Assert-Equal (Get-FileHash -LiteralPath $marker).Hash $markerHash
+    [IO.File]::Delete($marker)
+    Publish-FixtureFeed $zip $stable
+    Start-FixtureLauncher
+    Write-Output 'PASS hard interruption between app renames, preserved prior app and recovery marker, verified manual reinstall and launch'
+
     [IO.File]::WriteAllText((Join-Path $root 'app/ReleaseTrust.ps1'), '$script:UpdaterReleasePublicKey = ""')
     Start-FixtureLauncher 'Unavailable'
     Assert-Equal ([IO.File]::Exists($requestLog)) $false
