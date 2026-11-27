@@ -5,6 +5,7 @@
 - Preserve user data, browser and extension identity, disabled states, and native integrity and permission checks. Never weaken security requirements for convenience.
 - Keep changes focused. Prefer supported mechanisms and avoid unnecessary dependencies.
 - Run the automated checks and static validation relevant to the change. Perform focused isolated runtime validation when needed.
+- Run local tests with hidden windows, captured output, and no interactive prompts. Ask before launching a test that requires a visible window.
 - Before every game-engine test launch, verify silence through a supported option or an isolated profile with master volume and every audio category set to zero. Skip the test and report the gap if silence cannot be established.
 - Never terminate Chromium. Ask the user to close it manually before operations that require exclusive access, then verify that relevant processes have exited.
 - Document security decisions and update affected documentation in the same change.
