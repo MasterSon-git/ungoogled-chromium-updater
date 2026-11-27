@@ -10,10 +10,19 @@
 !src/
 !src/*.ps1
 !src/*.cs
+!src/Updater.version
 !tests/
 !tests/*.ps1
 !docs/
 !docs/*.md
+!tools/
+!tools/Release.ps1
+!tools/Actions-Release.ps1
+!tools/Test-Project.ps1
+!/.github/
+!/.github/workflows/
+!/.github/workflows/ci.yml
+!/.github/workflows/release.yml
 
 # Keep generated and private files out even inside these directories.
 *.local.*

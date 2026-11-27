@@ -22,6 +22,12 @@ Keep a current, trusted installation of [official 7-Zip](https://www.7-zip.org/d
 
 Add a verified Chrome Web Store extension's exact ID to `extensions` with the value `"ChromeWebStore"` after checking its official listing and developer identity. See [extension maintenance](docs/extensions.md) for official GitHub channels and migration. The first run reports unapproved sources for review.
 
+### Updater releases
+
+The updater checks this project's GitHub Releases on eligible launches through a shortcut or `app\ChromiumUpdater.exe`. `selfUpdateEnabled` defaults to `true`. `updaterChannel` defaults to `"Stable"`, which accepts stable updater releases. Set it to `"Staging"` to also receive updater prereleases. The updater only installs a higher version, so switching back to Stable may mean waiting for a newer stable release. Self-update replaces the launcher, bootstrap, worker and maintenance code at the existing shortcut target. Chromium and extension channels keep their stable release policies.
+
+Automatic updater releases require a maintainer-approved public signing pin in the installed updater and a publicly accessible release feed. A failed, deferred or unavailable updater check is reported separately from the browser and extension checks. Set `"selfUpdateEnabled": false` to pause updater self-updates. See [manual installation and recovery](docs/maintenance.md#updater-maintenance-and-recovery) for upgrades from an older installation, verification, and repair.
+
 ## Launch and check
 
 Start Chromium from an integrated Desktop or Start Menu shortcut. The first applicable launch on each Windows local day shows a color-coded console. The launcher starts Chromium after the check. A complete check is reused for the rest of the local day. Deferred work retries after 15 minutes, failures after 30 minutes, and items requiring review after two hours. A new day or a forced check bypasses those intervals. A warning or error stays visible until acknowledged.
@@ -36,7 +42,7 @@ $update = Join-Path $env:LOCALAPPDATA 'UngoogledChromiumUpdater\app\Update.ps1'
 & $update -Force -BrowserArguments @('--profile-directory=Default','https://example.com/')
 ```
 
-`-CheckOnly` checks release metadata and, where needed, verifies extension packages in memory. `-VerifyCurrent` also checks signed packages for the same installed version. `-Stage` stages and verifies the installer for an available update or an unknown installed packaging revision. Add `-TestCompatibility` to run the isolated test with the latest verified stable full uBlock Origin and cache a pass for the exact artifacts. The result identifies the tested version and warns if an installed full uBlock Origin version differs. Other MV2 extensions are outside the test. These modes leave the installed browser, production profiles, and daily check state untouched. The script returns 0 for a completed check, 1 for failure, and 2 for pending action or deferral. Read the individual results for patch-gap warnings and compatibility outcomes.
+`-CheckOnly` checks release metadata and, where needed, verifies extension packages in memory. `-VerifyCurrent` also checks signed packages for the same installed version. `-Stage` stages and verifies the installer for an available update or an unknown installed packaging revision. Add `-TestCompatibility` to run the isolated test with the latest verified stable full uBlock Origin and cache a pass for the exact artifacts. The result identifies the tested version and warns if an installed full uBlock Origin version differs. Other MV2 extensions are outside the test. In `-CheckOnly` and `-Stage`, the installed updater, browser, production profiles, and daily check state stay untouched. The script returns 0 for a completed check, 1 for failure, and 2 for pending action or deferral. Read the individual results for patch-gap warnings and compatibility outcomes.
 
 Pass browser arguments directly to `app\ChromiumUpdater.exe` for a quiet shortcut invocation with normal daily behavior. It forwards URLs and arguments as individual strings. The launcher only coordinates launches that go through it.
 
@@ -44,7 +50,7 @@ Pass browser arguments directly to `app\ChromiumUpdater.exe` for a quiet shortcu
 
 Setup backs up the original Desktop and Start Menu shortcuts before changing their targets. Existing arguments, icons, and working directories are preserved. Pinned Chromium, direct `chrome.exe` launches, default HTTP/HTTPS handlers and file associations can bypass the updater. The taskbar can use a separately pinned launcher where Windows offers that action. The native Chromium taskbar pin continues to identify Chromium itself.
 
-Run `.\src\Setup.ps1 -Uninstall` from the checkout, or run the installed `app\Setup.ps1 -Uninstall`. Setup restores the backed-up shortcuts and removes the launcher files. If a shortcut was edited after integration, use the corresponding copy in `shortcut-backups` to restore it manually. Remove any separate updater pin in Windows. The private runtime directory retains configuration, logs and recovery data.
+Run `app\Setup.ps1 -Uninstall` to use the installed version's maintenance code. You can also use `.\src\Setup.ps1 -Uninstall` from a current trusted checkout. Setup restores the backed-up shortcuts and removes the launcher files. If a shortcut was edited after integration, use the corresponding copy in `shortcut-backups` to restore it manually. Remove any separate updater pin in Windows. The private runtime directory retains configuration, logs and recovery data.
 
 See [browser maintenance and recovery](docs/maintenance.md), [extension maintenance](docs/extensions.md), [security](SECURITY.md), and [development](CONTRIBUTING.md).
 

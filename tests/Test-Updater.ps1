@@ -551,14 +551,14 @@ public static class InstallerFixture {
             if ($Message -like '*installed browser files do not match the verified installer payload*') { $calls.PayloadMismatch = $true }
         }
         function Start-Chromium { $calls.Launch++ }
-        Assert-Equal (Invoke-Launcher) 1
+        Assert-Equal (Invoke-UpdateSession $root) 1
         Assert-Equal ([IO.File]::ReadAllText($dll)) 'after'
         Assert-Equal $calls.PayloadMismatch $true
         Assert-Equal (Read-Json $pending).Tag $candidate.Tag
         Assert-Equal (Read-Json $stateFile).Tag $previousRelease.Tag
         Assert-Equal (Read-Json $stateFile).Digest $previousRelease.Digest
         Assert-Equal (Read-Json $stateFile).Identity $previousRelease.Identity
-        Assert-Equal (Invoke-Launcher) 1
+        Assert-Equal (Invoke-UpdateSession $root) 1
         Assert-Equal $calls.Launch 0
         [IO.File]::Delete($pending)
         [IO.File]::Delete($stateFile)

@@ -1,4 +1,16 @@
-# Browser maintenance and recovery
+# Updater and browser maintenance
+
+## Updater maintenance and recovery
+
+An existing configuration without updater settings uses Stable and enabled self-updates. Setup and self-updates preserve existing browser and extension settings. Existing installations that predate the self-update launcher need one manual `Setup.ps1 -Install` from a reviewed checkout or a verified package.
+
+The updater checks for a release before browser and extension checks on an eligible EXE launch. The downloaded package is verified and the replacement launcher is compiled in staging. A separate handoff waits for the initiating updater worker and the installed launcher to exit, then replaces the app directory at the same shortcut target. The new app carries the slot selector and the updated bootstrap and Setup scripts. The handoff resumes with the original browser arguments and working directory and performs a single browser check.
+
+A download, signature, or probe failure keeps the current app and worker active and allows the browser check to continue. The console and daily state report updater failure, deferral or unavailability separately. When the browser and extension checks complete, an updater warning leaves their normal once-a-day schedule in place. The previous app and worker are kept after an update. An interrupted attempt before the directory swap leaves the current app available. The next eligible attempt can replace abandoned staging data.
+
+If the launcher reports a damaged installation or the shortcut target is missing after an interruption, let updater operations finish and run `Setup.ps1 -Install` from a trusted checkout or verified release of the intended version. A manual install resets the selector and replaces the fixed launcher and its base worker. Review the version before deliberately reverting because an older version can restore an older signing pin. For a downloaded release, verify the ZIP and its `.sig` using the release tool with the independently trusted public pin, extract into a new local directory and invoke Setup there. [Release verification](releases.md#verify-and-reinstall)
+
+A pending `installation.json` still requires the browser recovery procedure below after an updater reinstall. Leave private configuration, backups and recovery records in place. To pause updater downloads while investigating a release, set `"selfUpdateEnabled": false` in `config.json` while the updater is idle.
 
 ## Browser update policy
 
@@ -37,10 +49,14 @@ All paths below are under `%LOCALAPPDATA%\UngoogledChromiumUpdater`.
 
 | Path | Contents |
 | --- | --- |
-| `app` | Installed launcher and scripts |
+| `app` | Stable shortcut path with the active launcher and maintenance entry points |
+| `app/updater-slot.json` | Slot and version installed with the replacement app |
+| `updater-a`, `updater-b` | Alternating updater worker directories |
+| `updater-work` | Temporary package, replacement app and handoff plan |
+| `updater-previous-app` | Previous launcher and entry scripts retained after a swap |
 | `config.json` | Private browser and extension source configuration |
 | `config.legacy.json` | Original private configuration retained during migration |
-| `state.json` | Daily status and installed extension version and manifest permission baselines |
+| `state.json` | Daily browser and extension status, separate updater outcome, and extension baselines |
 | `browser-release.json` | Last verified Windows release tag, installer digest, architecture and installed application fingerprint |
 | `mv2-pass.json` | Latest successful compatibility result and associated artifact identities and file hashes |
 | `mv2-work` | Single temporary extraction and profile directory, retained if cleanup needs attention |

@@ -6,12 +6,14 @@ function Get-UpdaterRoot {
     Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'UngoogledChromiumUpdater'
 }
 
-function New-PrivateRoot {
-    $root = Get-UpdaterRoot
+function New-PrivateRoot([string]$Root = (Get-UpdaterRoot)) {
+    Assert-LocalPath $root
+    $root = [IO.Path]::GetFullPath($root)
     if (!(Test-Path -LiteralPath $root)) {
         [void][IO.Directory]::CreateDirectory($root)
         $acl = [Security.AccessControl.DirectorySecurity]::new()
         $acl.SetAccessRuleProtection($true, $false)
+        $acl.SetOwner([Security.Principal.WindowsIdentity]::GetCurrent().User)
         foreach ($sid in @(Get-AllowedSid)) {
             $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
                 $sid, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow'))
@@ -84,6 +86,32 @@ function Enter-UpdateLock([string]$Root, [int]$WaitSeconds = 0) {
     } while ($true)
 }
 
+function Get-UpdaterSlot([string]$Root) {
+    $app = Join-Path $Root 'app'
+    $path = Join-Path $app 'updater-slot.json'
+    Assert-LocalPath $path
+    if (![IO.File]::Exists($path)) {
+        return @{ Slot = 'app'; Directory = $app }
+    }
+    if ((Get-Item -LiteralPath $path).Length -gt 512) { throw 'Invalid updater activation record.' }
+    $active = Read-Json $path
+    if ($active.Schema -ne 1 -or $active.Slot -cnotin 'updater-a','updater-b') {
+        throw 'Invalid updater activation record.'
+    }
+    $directory = Join-Path $Root $active.Slot
+    $version = Join-Path $directory 'Updater.version'
+    Assert-LocalPath $version
+    $bootstrapVersion = Join-Path $app 'Updater.version'
+    Assert-LocalPath $bootstrapVersion
+    if ($active.Version -isnot [string] -or $active.Version.Length -gt 128 -or
+        (Get-Item -LiteralPath $version).Length -gt 130 -or [IO.File]::ReadAllText($version).Trim() -cne $active.Version -or
+        (Get-Item -LiteralPath $bootstrapVersion).Length -gt 130 -or
+        [IO.File]::ReadAllText($bootstrapVersion).Trim() -cne $active.Version) {
+        throw 'The active updater version does not match its activation record.'
+    }
+    @{ Slot = $active.Slot; Directory = $directory }
+}
+
 function Convert-LegacyBrowserConfig($Config) {
     if ($Config.Contains('browserUpdateMode')) { return $false }
     if ($Config['installOnLaunch'] -isnot [bool]) { throw 'Invalid legacy browser configuration.' }
@@ -103,6 +131,11 @@ function Read-Config([string]$Root) {
     $config = Read-Json $path
     $legacy = Convert-LegacyBrowserConfig $config
     $config['legacyBrowserConfig'] = $legacy
+    if (!$config.Contains('selfUpdateEnabled')) { $config['selfUpdateEnabled'] = $true }
+    if (!$config.Contains('updaterChannel')) { $config['updaterChannel'] = 'Stable' }
+    if ($config['selfUpdateEnabled'] -isnot [bool] -or $config['updaterChannel'] -cnotin 'Stable','Staging') {
+        throw 'Invalid updater self-update configuration.'
+    }
     $trust = $config['browserTrust']
     if ($config.architecture -cnotin 'x86','x64','arm64' -or
         $config.browserUpdateMode -cnotin 'Automatic','Manual' -or
@@ -223,11 +256,12 @@ function Get-StableRelease([ValidateSet('ungoogled-software/ungoogled-chromium-w
 
 function Get-ReleaseAsset($Release, [string]$Repository, [string]$Name) {
     $assets = @($Release.assets | Where-Object { $_.name -ceq $Name })
-    if ($assets.Count -ne 1) { throw 'The expected stable release artifact is unavailable.' }
+    if ($assets.Count -ne 1) { throw 'The expected release artifact is unavailable.' }
     $asset = $assets[0]
     $expected = "https://github.com/$Repository/releases/download/$($Release.tag_name)/$Name"
     if ($asset.browser_download_url -cne $expected -or $asset.state -cne 'uploaded' -or
-        $asset.digest -cnotmatch '^sha256:[a-f0-9]{64}$' -or $asset.size -le 0) {
+        $asset.digest -cnotmatch '^sha256:[a-f0-9]{64}$' -or
+        ($asset.size -isnot [int] -and $asset.size -isnot [long]) -or $asset.size -le 0) {
         throw 'Unexpected release artifact URL, size or SHA-256 metadata.'
     }
     @{ Uri = $expected; Name = $Name; Digest = $asset.digest.Substring(7); Size = [long]$asset.size }
