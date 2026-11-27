@@ -104,11 +104,19 @@ function Set-LauncherShortcuts([string]$Root, [bool]$Restore) {
             Write-Host "[ OK ] Restored the original $kind Chromium shortcut."
             continue
         }
-        if ($link.TargetPath -ieq $launcher -and $record) { continue }
-        if ($link.TargetPath -ine $config.browserPath) { throw "The $kind shortcut does not target the configured Chromium." }
-        if ($record) {
-            if ($hash -ne $record.Original) { throw "The $kind shortcut was edited. Review its backup before reintegrating." }
+        if ($link.TargetPath -ieq $launcher -and $record) {
+            if ($record['Managed'] -and $hash -ne $record.Managed) { throw "The managed $kind shortcut was edited." }
+            $original = $shell.CreateShortcut($backup)
+            if ($link.WorkingDirectory -ceq $original.WorkingDirectory -and $record['Managed']) { continue }
+            $workingDirectory = $original.WorkingDirectory
+        } elseif ($link.TargetPath -ine $config.browserPath) {
+            throw "The $kind shortcut does not target the configured Chromium."
         } else {
+            $workingDirectory = $link.WorkingDirectory
+        }
+        if ($record -and $link.TargetPath -ine $launcher) {
+            if ($hash -ne $record.Original) { throw "The $kind shortcut was edited. Review its backup before reintegrating." }
+        } elseif (!$record) {
             [IO.File]::Copy($path, $backup, $false)
             $record = @{ Path = $path; Arguments = $link.Arguments; Original = $hash; Managed = $null }
             $records[$kind] = $record
@@ -116,8 +124,11 @@ function Set-LauncherShortcuts([string]$Root, [bool]$Restore) {
         }
         $icon = $link.IconLocation
         if (!$icon -or $icon -eq ',0') { $icon = $config.browserPath + ',0' }
+        $arguments = $link.Arguments
         $link.TargetPath = $launcher
         $link.IconLocation = $icon
+        $link.Arguments = $arguments
+        $link.WorkingDirectory = $workingDirectory
         $link.Save()
         $record['Managed'] = (Get-FileHash -LiteralPath $path).Hash
         Write-Json $infoPath $records

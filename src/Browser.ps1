@@ -189,12 +189,19 @@ function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $
     $backup = New-BrowserBackup $Root $Config $Installed
     if (!(Test-ArtifactFile $Artifact.Path $Candidate)) { throw 'The staged installer changed after verification.' }
     if (Test-BrowserBusy $Config) { return 'Deferred' }
+    $installPreferences = Join-Path $Root 'installer-preferences.json'
+    Write-Json $installPreferences @{ distribution = @{ do_not_create_any_shortcuts = $true } }
     Write-Json $pending @{ Previous = $Installed.ToString(); Candidate = $Candidate.Version.ToString(); Tag = $Candidate.Tag; Backup = $backup }
-    if (Test-BrowserBusy $Config) { [IO.File]::Delete($pending); return 'Deferred' }
+    if (Test-BrowserBusy $Config) {
+        [IO.File]::Delete($pending)
+        [IO.File]::Delete($installPreferences)
+        return 'Deferred'
+    }
     Write-Status INFO 'Running the verified per-user Chromium installer.'
     $start = [Diagnostics.ProcessStartInfo]::new($Artifact.Path)
     $start.UseShellExecute = $false
     [void]$start.ArgumentList.Add('--do-not-launch-chrome')
+    [void]$start.ArgumentList.Add("--installerdata=$installPreferences")
     $process = [Diagnostics.Process]::Start($start)
     try {
         if (!$process.WaitForExit(180000)) { throw 'The installer is still running. Check recovery instructions before launching.' }
@@ -206,6 +213,7 @@ function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $
     }
     Assert-RegisteredInstall $Config $Candidate.Version
     [IO.File]::Delete($pending)
+    [IO.File]::Delete($installPreferences)
     try { Remove-ExpiredBackups $Root $backup } catch { Write-Status WARN 'Backup retention needs manual attention.' }
     'Installed'
 }

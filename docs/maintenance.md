@@ -9,7 +9,7 @@
 5. Export uBlock Origin settings through its dashboard as described in [extensions.md](extensions.md). Close all Chromium windows and background instances. Run `Update.ps1 -Apply -NoLaunch` while Chromium is closed. Keep the browser closed during backup and installation. For future validated releases, set `installOnLaunch` to true if you prefer to apply approved builds on a covered launch while Chromium is closed.
 6. Read the summary and verify the installed version. Start Chromium, check the existing profiles and extensions, and verify filtering again in the production browser. Browser flags and policies are left to Chromium and the operator.
 
-The updater holds an exclusive per-user file lock across checks, backups, installation and the handoff to Chromium. It stages the official installer, backs up both Application and User Data with Robocopy, verifies the copy, then delegates file and registration changes to the per-user installer. It checks the resulting executable version, architecture, registration and deferred executable. Direct browser launches remain possible during this process. Avoid them while the installer is active.
+The updater holds an exclusive per-user file lock across checks, backups, installation and the handoff to Chromium. It stages the official installer, backs up both Application and User Data with Robocopy, verifies the copy, then delegates file and registration changes to the per-user installer. It passes Chromium's documented installer preferences to preserve existing shortcuts during updates. It checks the resulting executable version, architecture, registration and deferred executable. Direct browser launches remain possible during this process. Avoid them while the installer is active.
 
 ## Local storage
 
