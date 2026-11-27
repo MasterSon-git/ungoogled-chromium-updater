@@ -79,9 +79,11 @@ if ($Phase -eq 'Sign') {
 Assert-LocalPath $signature
 [IO.File]::Copy($signature, "$package.sig")
 Test-UpdaterReleasePackage $package $release.Version $verified $publicKey
-$immutable = gh api -H 'X-GitHub-Api-Version: 2026-03-10' "repos/$script:UpdaterRepository/immutable-releases" --jq '.enabled'
-if ($LASTEXITCODE -or $immutable -cne 'true') { throw 'Enable immutable releases before publishing.' }
 $options = @('--verify-tag','--notes-from-tag','--repo',$script:UpdaterRepository)
 if ($release.Prerelease) { $options += '--prerelease' }
 gh release create $release.Tag $package "$package.sig" @options
 if ($LASTEXITCODE) { throw 'GitHub release publication failed. Inspect the release before retrying.' }
+$immutable = gh api "repos/$script:UpdaterRepository/releases/tags/$($release.Tag)" --jq '.immutable'
+if ($LASTEXITCODE -or $immutable -cne 'true') {
+    throw 'The release was published, but GitHub did not confirm immutability. Inspect the release before validation or retry.'
+}

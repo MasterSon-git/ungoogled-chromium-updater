@@ -17,7 +17,7 @@ function Assert-Fails([scriptblock]$Action, [string]$Pattern) {
 function New-FixtureRelease([string]$Version, [string]$Package) {
     $tag = "v$Version"
     @{
-        id = 123; tag_name = $tag; draft = $false; prerelease = $Version.Contains('-')
+        id = 123; tag_name = $tag; draft = $false; prerelease = $Version.Contains('-'); immutable = $true
         url = "https://api.github.com/repos/$script:UpdaterRepository/releases/123"
         html_url = "https://github.com/$script:UpdaterRepository/releases/tag/$tag"
         assets = @(foreach ($file in $Package,"$Package.sig") {
@@ -226,6 +226,9 @@ function Get-UpdaterPackageFiles {
     $wrong.prerelease = $false
     Assert-Fails { Select-UpdaterRelease @($wrong) $base Staging } 'release identity'
     Assert-Equal (Select-UpdaterRelease @($wrong) $base Stable) $null
+    $wrong = $stable.Clone()
+    $wrong.immutable = $false
+    Assert-Fails { Select-UpdaterRelease @($wrong) $base Stable } 'immutability'
     $wrong = $stable.Clone()
     $wrong.prerelease = $true
     Assert-Equal (Select-UpdaterRelease @($wrong) $base Stable) $null

@@ -94,6 +94,9 @@ function Select-UpdaterRelease($Releases, $Installed, [string]$Channel) {
             $release['html_url'] -cne "https://github.com/$script:UpdaterRepository/releases/tag/$tag") {
             throw 'Unexpected updater release identity.'
         }
+        if ($release['immutable'] -isnot [bool] -or !$release['immutable']) {
+            throw 'Updater release immutability could not be confirmed.'
+        }
         $version = $candidate
         $best = $release
     }
