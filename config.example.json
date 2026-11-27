@@ -1,0 +1,9 @@
+{
+  "browserPath": "%LOCALAPPDATA%\\Chromium\\Application\\chrome.exe",
+  "userData": "%LOCALAPPDATA%\\Chromium\\User Data",
+  "browserArgs": [],
+  "architecture": "x64",
+  "installOnLaunch": false,
+  "browserApproval": null,
+  "extensions": {}
+}
