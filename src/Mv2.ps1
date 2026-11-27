@@ -191,13 +191,6 @@ function Invoke-Mv2Fixture([string]$Lab, [string]$Exe, $Ubo, $Run) {
     }
 }
 
-function Remove-Mv2Lab([string]$Root, [string]$Lab) {
-    if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Lab)) -ine $Root -or
-        [IO.Path]::GetFileName($Lab) -cne 'mv2-work') { throw 'Unexpected compatibility workspace.' }
-    Assert-OrdinaryTree $Lab
-    Remove-Item -LiteralPath $Lab -Recurse -Force
-}
-
 function Get-BrowserCompatibility([string]$Root, $Candidate, $Artifact, [bool]$NeedsMv2) {
     $lab = Join-Path $Root 'mv2-work'
     $cachePath = Join-Path $Root 'mv2-pass.json'
@@ -221,7 +214,8 @@ function Get-BrowserCompatibility([string]$Root, $Candidate, $Artifact, [bool]$N
                     $cache['Files'] -is [Collections.IDictionary] -and $cache['Files']['chrome.exe'] -and
                     $cache['Files']["$($Candidate.Version)\chrome.dll"]) {
                     if (!(Test-ArtifactFile $Artifact.Path $Candidate)) { throw 'The staged installer no longer matches the cached test.' }
-                    return @{ Status = 'Pass'; Detail = 'Exact artifact identities match a prior successful MV2 test.'; Files = $cache.Files }
+                    return @{ Status = 'Pass'; Detail = 'Exact artifact identities match a prior successful MV2 test.'
+                        Files = $cache.Files; UboVersion = $uboAsset.Version }
                 }
             }
         }
@@ -232,6 +226,7 @@ function Get-BrowserCompatibility([string]$Root, $Candidate, $Artifact, [bool]$N
             $ubo = Get-VerifiedExtensionPackage $uboAsset $script:UboId $false
             if (!(Test-FullUboManifest $ubo.Manifest)) { throw 'The verified uBlock Origin manifest changed its source or Manifest version.' }
             $result = Invoke-Mv2Fixture $lab $payload.Exe $ubo $run
+            $result.UboVersion = $uboAsset.Version
         } else { $result = @{ Status = 'Pass'; Detail = 'Verified the exact same-version installer payload.' } }
     } catch [NotSupportedException] {
         $result = @{ Status = 'Inconclusive'; Detail = $_.Exception.Message }

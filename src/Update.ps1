@@ -141,7 +141,7 @@ function Test-Mv2Needed($Inventory) {
     @($Inventory | Where-Object { $_.Location -notin 5,10 -and (!$_.Manifest -or $_.Manifest['manifest_version'] -ne 3) }).Count -gt 0
 }
 
-function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [bool]$InventoryReady, [bool]$HasMv2) {
+function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [bool]$InventoryReady, $Inventory) {
     $release = Get-BrowserReleaseStatus $Root $Config $Installed $Candidate
     switch ($release) {
         Older { Write-Status WARN 'The installed Chromium version or packaging revision is newer than the official stable candidate.' }
@@ -156,7 +156,7 @@ function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [
         if ($TestCompatibility) {
             Assert-BrowserTrust $Config.browserTrust $artifact
             $test = Get-BrowserCompatibility $Root $Candidate $artifact $true
-            $status = Write-CompatibilityResult $test
+            $status = Write-CompatibilityResult $test $Inventory
             if ($status -ne 'Complete') { return @{ Status = $status; Version = $Installed } }
         }
     }
@@ -180,11 +180,12 @@ function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [
         Assert-RegisteredInstall $Config $Installed
         $artifact = Get-BrowserArtifact $Root $Candidate
         Assert-BrowserTrust $Config.browserTrust $artifact
-        $hasMv2 = $HasMv2 -or (Test-Mv2Needed @(Get-ExtensionInventory $Config.userData))
+        $installInventory = @(Get-ExtensionInventory $Config.userData)
+        $hasMv2 = (Test-Mv2Needed $Inventory) -or (Test-Mv2Needed $installInventory)
         $payload = $null
         if ($hasMv2 -or $Candidate.Version -eq $Installed) {
             $test = Get-BrowserCompatibility $Root $Candidate $artifact $hasMv2
-            $status = Write-CompatibilityResult $test
+            $status = Write-CompatibilityResult $test $installInventory
             if ($status -ne 'Complete') { return @{ Status = $status; Version = $Installed } }
             $payload = $test.Files
         }
@@ -204,7 +205,22 @@ function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [
     @{ Status = $status; Version = $Installed }
 }
 
-function Write-CompatibilityResult($Test) {
+function Write-CompatibilityResult($Test, $Inventory) {
+    if ($Test['UboVersion']) {
+        $tested = Get-Version $Test.UboVersion
+        Write-Status INFO "The isolated MV2 test covers full uBlock Origin $($Test.UboVersion) from GitHub. Other installed MV2 extensions were not tested."
+        $different = foreach ($extension in $Inventory) {
+            if ($extension.Id -notin $script:UboId,$script:OldUboId) { continue }
+            $version = if ($extension.Manifest) { $extension.Manifest['version'] }
+            try {
+                if ((Get-Version $version) -ne $tested) { $version }
+            } catch { 'unknown' }
+        }
+        if ($different) {
+            $versions = ($different | Sort-Object -Unique) -join ', '
+            Write-Status WARN "Installed full uBlock Origin version(s) $versions were not matched by the test of $($Test.UboVersion). Compatibility for those installations is unverified."
+        }
+    }
     if ($Test.Status -eq 'Pass') {
         Write-Status ' OK ' "Browser compatibility pass. $($Test.Detail)"
         return 'Complete'
@@ -236,7 +252,7 @@ function Invoke-Workflow($Root, $Config, $Previous) {
     try {
         $candidate = Get-WindowsCandidate $Config.architecture
         Write-Status CHECK "Official stable ungoogled-chromium Windows build: $($candidate.Tag)."
-        $update = Invoke-BrowserUpdate $Root $Config $installed $candidate $inventoryReady (Test-Mv2Needed $inventory)
+        $update = Invoke-BrowserUpdate $Root $Config $installed $candidate $inventoryReady $inventory
         $installed = $update.Version
         $results.Add($update.Status)
     } catch {

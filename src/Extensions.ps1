@@ -4,7 +4,6 @@ $script:OldUboId = 'cjpalhdlnbpafiamejdnhcphjbkeiagm'
 $script:WebStoreId = 'ocaahdebbfolfmndjeplogmgcagdmblk'
 $script:UboUrl = 'https://cdn.jsdelivr.net/gh/gorhill/uBlock@master/dist/chromium/update.xml'
 $script:WebStoreUrl = 'https://raw.githubusercontent.com/NeverDecaf/chromium-web-store/master/updates.xml'
-$script:GitHubAssetHosts = @('github.com','release-assets.githubusercontent.com','objects.githubusercontent.com')
 
 function Initialize-CrxVerifier {
     if (!('Crx3' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'Crx3.cs') }

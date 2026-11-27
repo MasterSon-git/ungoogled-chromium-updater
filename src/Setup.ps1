@@ -7,6 +7,12 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
+. (Join-Path $PSScriptRoot 'Browser.ps1')
+. (Join-Path $PSScriptRoot 'BrowserPayload.ps1')
+
+function Write-Status([string]$Level, [string]$Message) {
+    Write-Host "[$Level] $Message"
+}
 
 function Install-LauncherFiles([string]$Root) {
     $shell = @(
@@ -47,12 +53,19 @@ function Install-LauncherFiles([string]$Root) {
     }
     if ($hadApp) { Remove-LauncherDirectory $Root $previous }
     $settings = Read-Json $config
+    $legacyApproval = $settings['browserApproval']
     if (Convert-LegacyBrowserConfig $settings) {
         $legacyPath = Join-Path $Root 'config.legacy.json'
         Assert-LocalPath $legacyPath
         if (!(Test-Path -LiteralPath $legacyPath)) { [IO.File]::Copy($config, $legacyPath) }
         Write-Json $config $settings
         Write-Host '[WARN] Legacy browser settings migrated to Manual mode. Review browserTrust in config.json before applying an update.'
+        $tag = try { Initialize-BrowserRelease $Root (Read-Config $Root) $legacyApproval }
+        catch { Write-Status WARN 'Could not verify the legacy installation evidence. See browser maintenance.' }
+        if ($tag) { Write-Status ' OK ' "Recorded installed Windows distribution release $tag." }
+        elseif (![IO.File]::Exists((Join-Path $Root 'browser-release.json'))) {
+            Write-Status WARN 'The installed Windows packaging revision remains unknown.'
+        }
     }
     Write-Host '[ OK ] Launcher installed under Local AppData. Configure it before integrating shortcuts.'
 }

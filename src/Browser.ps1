@@ -70,19 +70,33 @@ function Assert-BrowserTrust($Trust, $Artifact) {
     }
 }
 
-function Get-InstalledBrowserIdentity($Config, [version]$Version) {
+function Get-InstalledBrowserIdentity($Config, [version]$Version, $ExpectedFiles) {
     $app = [IO.Path]::GetDirectoryName($Config.browserPath)
     $versionDirectory = Join-Path $app $Version.ToString()
     Assert-OrdinaryTree $versionDirectory
     [string[]]$files = @($Config.browserPath, (Join-Path $app 'chrome_proxy.exe')) +
         @(Get-ChildItem -LiteralPath $versionDirectory -File -Recurse -Force | ForEach-Object FullName)
     [Array]::Sort($files, [StringComparer]::Ordinal)
+    $matched = 0
     $contents = foreach ($file in $files) {
         Assert-LocalPath $file
         $relative = [IO.Path]::GetRelativePath($app, $file)
-        "$relative=$((Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash)"
+        $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash
+        if ($ExpectedFiles -and $ExpectedFiles.Contains($relative)) {
+            if ($ExpectedFiles[$relative] -ine $hash) { return }
+            $matched++
+        }
+        "$relative=$hash"
     }
+    if ($ExpectedFiles -and $matched -ne $ExpectedFiles.Count) { return }
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($contents -join "`n")))
+}
+
+function Write-BrowserRelease([string]$Root, $Candidate, [string]$Identity) {
+    Write-Json (Join-Path $Root 'browser-release.json') @{
+        Tag = $Candidate.Tag; Digest = $Candidate.Digest; Architecture = $Candidate.Architecture
+        Identity = $Identity
+    }
 }
 
 function Get-BrowserReleaseStatus([string]$Root, $Config, [version]$Installed, $Candidate) {
@@ -270,14 +284,18 @@ function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $
     if ($Payload -and !(Test-BrowserPayload ([IO.Path]::GetDirectoryName($Config.browserPath)) $Payload)) {
         throw 'The installed browser files do not match the verified installer payload.'
     }
-    Write-Json (Join-Path $Root 'browser-release.json') @{
-        Tag = $Candidate.Tag; Digest = $Candidate.Digest; Architecture = $Candidate.Architecture
-        Identity = Get-InstalledBrowserIdentity $Config $Candidate.Version
-    }
+    Write-BrowserRelease $Root $Candidate (Get-InstalledBrowserIdentity $Config $Candidate.Version)
     [IO.File]::Delete($pending)
     [IO.File]::Delete($installPreferences)
     try { Remove-ExpiredBackups $Root $backup } catch { Write-Status WARN 'Backup retention needs manual attention.' }
     'Installed'
+}
+
+function Remove-Mv2Lab([string]$Root, [string]$Lab) {
+    if ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($Lab)) -ine $Root -or
+        [IO.Path]::GetFileName($Lab) -cne 'mv2-work') { throw 'Unexpected compatibility workspace.' }
+    Assert-OrdinaryTree $Lab
+    Remove-Item -LiteralPath $Lab -Recurse -Force
 }
 
 function Start-Chromium($Config, [string[]]$BrowserArguments) {

@@ -1,5 +1,6 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:GitHubAssetHosts = @('github.com','release-assets.githubusercontent.com','objects.githubusercontent.com')
 
 function Get-UpdaterRoot {
     Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'UngoogledChromiumUpdater'
