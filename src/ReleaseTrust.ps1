@@ -1,6 +1,21 @@
-# Pin the maintainer's RSA SubjectPublicKeyInfo PEM in a separately approved change.
-# An empty pin disables release discovery and installation.
-$script:UpdaterReleasePublicKey = ''
+# Maintainer-approved RSA SubjectPublicKeyInfo PEM.
+# SHA-256 (DER): ABF9036CE184427EEF0E2E4C8A7EC3754FF4C7AF59A5F49DAC9CA45D061B2A55
+$script:UpdaterReleasePublicKey = @'
+-----BEGIN PUBLIC KEY-----
+MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAxLyjv53vfVf36RzrbyBN
+w/mBBfDnrD0L4+5awlOP8YFGjFmfTKq97dGGAvVF9/z6rA+uXOC/X3vHw2tHDrsA
+CqIUrRBa1gFzTKOaDEZBWX6dW26GuH7dC2mjGEqx666iZEyabFVfNXZw+cnoO5D4
+ggHM1m0xWJWCn9nSHuC/HeQQXK62S0GLUcWwXlfIwEDiUBRz2ny9wkVSzDlFcqwK
+YBWclA1NN0YU8jO4w18iTpogRcZfbhZ/WuhjNq729Wcr/GotGp8AKNKSrjke1ARD
+3Z4zyqPggYA+KA05P1+7rhwMycR21N2ZzzUmNND/74HWyC8Xn4erX4AF2HtfVuKf
+QBBPOpjglFZXlsqfl0BXPehBbGUqP69k/GORk4r0aK1zSddkdT9hA/vxjBcB9Zx8
+7DtElEJFOtpRLIO1qfqHZpT58IDlm04BVScxykK6+6/jnT15M5FgN3LQAMu990nR
+wixC9xGzVF4wcU8XbSQlTshGvWgfJrYQRpI8DMVS8G1/u59K480wxcO9RwwrLHM1
+c2+H/9lUlK8FD8HnRB4bhS+CAHLW36Tz9bvpyUKD8URbIPNQbFidWUOS//LvSK1q
+VXFvw+A/bN2TqTl7YQiP2Wa+dqqdhmfnLcJ6iWDPZZf6OZJDcvJTojQG8BxYOnzq
+zHihINF28NoV7glBOZUKUI0CAwEAAQ==
+-----END PUBLIC KEY-----
+'@
 
 # A rotation bridge carries its previous client pin here for release jobs only.
 $script:UpdaterBridgeSigningPublicKey = ''
