@@ -4,6 +4,8 @@
 !README.md
 !CONTRIBUTING.md
 !SECURITY.md
+!/LICENSE
+!/THIRD_PARTY_NOTICES.md
 !config.example.json
 !src/
 !src/*.ps1

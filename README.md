@@ -2,6 +2,8 @@
 
 This Windows launcher automatically installs eligible stable builds from the official ungoogled-chromium Windows distribution when Chromium is closed. It verifies the installer, checks Manifest V2 compatibility when needed, and backs up the browser and profiles before installation. It reports the remaining Chrome stable patch gap and audits installed extension update channels. Extension installation uses Chromium's prompts.
 
+Ungoogled Chromium Updater is an independent, unofficial project. It has no affiliation with or endorsement from Chromium, the ungoogled-chromium projects, uBlock Origin, or the other upstream publishers it references.
+
 ## Install
 
 Run from PowerShell 7.5 or newer, as the same Windows user who runs Chromium.
@@ -45,3 +47,7 @@ Setup backs up the original Desktop and Start Menu shortcuts before changing the
 Run `.\src\Setup.ps1 -Uninstall` from the checkout, or run the installed `app\Setup.ps1 -Uninstall`. Setup restores the backed-up shortcuts and removes the launcher files. If a shortcut was edited after integration, use the corresponding copy in `shortcut-backups` to restore it manually. Remove any separate updater pin in Windows. The private runtime directory retains configuration, logs and recovery data.
 
 See [browser maintenance and recovery](docs/maintenance.md), [extension maintenance](docs/extensions.md), [security](SECURITY.md), and [development](CONTRIBUTING.md).
+
+## License
+
+Original project code, scripts, tooling, and documentation use [Zero-Clause BSD (0BSD)](LICENSE). Original creative assets, if added, use [CC0 1.0 Universal (CC0-1.0)](https://creativecommons.org/publicdomain/zero/1.0/). See [third-party notices](THIRD_PARTY_NOTICES.md) for upstream material, tools, and downloads.

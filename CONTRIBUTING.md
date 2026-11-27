@@ -15,4 +15,8 @@ For the integrated Windows gate, maintain a current, trusted installation of [of
 
 For an independent portable diagnostic, download the architecture-matched official Windows portable ZIP and signed full uBlock Origin CRX. Obtain their expected hashes from the official release API and pass them with `-BrowserZip`, `-BrowserSha256`, `-UboCrx`, and `-UboSha256` to `tests\Runtime.ps1`. The shared fixture uses Chromium's documented mute option and a loopback service to test background initialization, blocking, and an allowed request. This diagnostic does not establish installer equivalence. Exercise native signed installation, permission prompts, and update behavior in a separate isolated UI session when needed.
 
-Before committing, check the exact staged files and scan for local paths, credentials, profile information, log output and extension inventories. Keep any environment-specific assessment in private local storage.
+By submitting original code, scripts, tooling, or documentation, you agree to license that material under [Zero-Clause BSD (0BSD)](LICENSE). Attribution for original contributions is optional. Dedicate any original creative assets under [CC0 1.0 Universal (CC0-1.0)](https://creativecommons.org/publicdomain/zero/1.0/) and include its legal text with the first such asset.
+
+Before adding third-party code or assets, verify their source and applicable terms. Preserve the applicable copyright and license text, and record the source, affected files, and applicable terms in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Before committing, check the exact staged files and scan for local paths, credentials, profile information, log output and extension inventories. Keep any environment-specific assessment in private local storage. Select and review distribution package contents explicitly.
