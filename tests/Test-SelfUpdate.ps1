@@ -92,9 +92,9 @@ function Invoke-InterruptedFixtureHandoff([ValidateSet('before-renames','between
         if ($helper) {
             try {
                 if (!$helper.WaitForExit(10000)) { throw 'The interrupted handoff did not exit.' }
-                Assert-Equal $helper.ExitCode 88
             } finally { $helper.Dispose() }
         }
+        Assert-Equal ([IO.File]::ReadAllText($evidence)) $Point
         Assert-Equal ([IO.File]::Exists($argumentsFile)) $false
     } finally { [IO.File]::Delete($signal) }
 }
