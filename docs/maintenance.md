@@ -30,9 +30,30 @@ Rerun `Setup.ps1 -Install` from the checkout to migrate a configuration with `in
 
 The updater records the complete Windows tag and installer SHA-256 and links the record to a fingerprint of the installed application files. During legacy migration, Setup can initialize a missing record if the legacy log records a successful verified install of the currently published tag, the legacy approval matches its official installer digest and signing policy, and Windows registration and the installed files match the verified payload, including the embedded `setup.exe`. This comparison does not run the installer. Preserve the original logs and legacy configuration until migration is complete.
 
-Chromium version and numeric packaging revision are compared in that order. If installation evidence is missing or inconclusive, or an external repair or state loss leaves the revision unknown, the updater waits for a higher Chromium version. A lower release or a changed artifact for the recorded tag requires review. Chrome Version History is a separate comparison. A remaining patch gap or an unavailable API is reported even when a verified Windows update can be installed.
+Chromium version and numeric packaging revision are compared in that order. If installation evidence is missing or inconclusive, or an external repair or state loss leaves the revision unknown, the updater waits for a higher Chromium version. A lower release or a changed artifact for the recorded tag requires review.
 
-The updater holds an exclusive per-user file lock across checks, backups, installation and the handoff to Chromium. It stages the official installer, backs up both Application and User Data with Robocopy, verifies the copy, then delegates file and registration changes to the per-user installer. It passes Chromium's documented installer preferences to preserve existing shortcuts during updates. It checks the resulting executable version, architecture, registration and deferred executable. Direct browser launches remain possible during this process. Avoid them while the installer is active.
+The updater holds an exclusive per-user file lock across checks, backups, installation and the handoff to Chromium. It stages the official installer, verifies a closed-browser backup, then delegates file and registration changes to the per-user installer. It passes Chromium's documented installer preferences to preserve existing shortcuts during updates. It checks the resulting executable version, architecture, registration and deferred executable. Direct browser launches remain possible during this process. Keep Chromium closed until copying, verification and installation finish.
+
+## Backup verification
+
+Robocopy copies the full Application and User Data trees and checks them in list mode for differences it can observe in paths and file metadata. The updater also records SHA-256 hashes from the closed source before copying. After copying, it compares both the backup and the source with that record. Any copy error, missing or changed file in scope, hash read error, or observed browser restart prevents installation. The logs report the result and number of hashed files.
+
+The `sha256-v1` scope covers the primary contents of these files when present.
+
+- Every file under Application, including the browser binaries, installer and assets.
+- User Data's `Local State`. For each top-level profile directory, `Preferences`, `Secure Preferences`, `Bookmarks`, `Bookmarks.bak`, and the legacy `Current` and `Last` session and tab files.
+- Each profile's `History`, `Login Data`, `Login Data For Account`, `Web Data`, `Account Web Data`, and `Cookies` databases, including `Network\Cookies` and present SQLite journals, WAL and shared-memory files for those databases.
+- Each profile's `Sessions`, `Extensions`, `Extension State`, `Extension Rules`, `Extension Scripts`, `Local Extension Settings`, `Sync Extension Settings`, and `Managed Extension Settings` trees.
+
+Other profile files, including caches, IndexedDB and website storage, receive the full-tree Robocopy comparison. The scoped hashes keep the cost of multiple reads independent of those potentially large trees. [Robocopy options](https://learn.microsoft.com/en-us/windows-server/administration/windows-commands/robocopy) [Chromium preferences](https://chromium.googlesource.com/chromium/src/+/HEAD/chrome/browser/prefs/) [Chromium extension storage names](https://chromium.googlesource.com/chromium/src/+/HEAD/extensions/common/constants.h)
+
+The updater builds one `backups\incomplete` copy and promotes it to a completed snapshot only after verification. Allow disk space for a temporary full copy alongside the completed snapshots. The completion record contains the browser version, timestamp and scoped hashes. A failed copy leaves the previous completed snapshots available. The updater normally retains two completed snapshots and removes abandoned managed copies before a later backup. If pruning fails after promotion, the newly verified snapshot remains usable and the next attempt must clean up safely before allocating another copy. The launcher preserves backups while `installation.json` is present. If cleanup needs attention, open the private backup folder in File Explorer while the updater is idle and check for files held open or a redirected path. Preserve completed copies and recovery records.
+
+## Notifications and logs
+
+The first daily updater check shows the Windows release decision, compatibility and extension results, and the comparison with broadly served Chrome Stable. A remaining patch gap and an unavailable Chrome Version History comparison are advisories. Both appear in the console and log on any check that evaluates them. A later daily check reports the current comparison. Advisories alone use the completed daily schedule and allow an otherwise eligible Windows update.
+
+Genuine review items retry after two hours, deferrals after 15 minutes, and failures after 30 minutes. Recovery and unresolved compatibility problems remain visible. Pending extension handoffs can resume on the next regular launch after their Chromium setting is fixed. Self-update outcomes are recorded separately. Additions, changes and removals of browser-managed component registrations are informational inventory changes. [Extension handoff](extensions.md#install-a-verified-update)
 
 ## Manifest V2 compatibility
 
@@ -66,14 +87,14 @@ All paths below are under `%LOCALAPPDATA%\UngoogledChromiumUpdater`.
 | `updater-previous-app` | Previous launcher and entry scripts retained after a swap |
 | `config.json` | Private browser and extension source configuration |
 | `config.legacy.json` | Original private configuration retained during migration |
-| `state.json` | Daily check status, separate updater outcome, per-profile extension observations and permission baselines, CRX requests waiting for Chromium configuration or already submitted, and pending startup reconciliation |
+| `state.json` | Daily check status, separate updater and upstream comparison outcomes, per-profile extension observations and permission baselines, CRX handoff state, and pending startup reconciliation |
 | `browser-release.json` | Last verified Windows release tag, installer digest, architecture, installed application fingerprint and applicable full uBlock Origin test evidence |
 | `mv2-pass.json` | Latest successful compatibility result and associated artifact identities and file hashes |
 | `mv2-work` | Single temporary extraction and profile directory, retained if cleanup needs attention |
 | `logs` | Daily local logs, rotated at 512 KiB and retained for up to 30 days after a later check |
 | `downloads` | Most recent staged Windows installer, reverified before use |
 | `extension-packages` | Private cache of verified signed CRX candidates awaiting native installation |
-| `backups` | Two verified browser and profile copies after successful installation |
+| `backups` | Two completed Application and User Data snapshots under normal retention, plus a reusable incomplete workspace during backup |
 | `installation.json` | Recovery marker written immediately before starting the installer |
 | `shortcut-backups` | Original Desktop and Start Menu shortcuts |
 | `updater-shortcut.json` | Dedicated shortcut path, icon source and ownership hashes |
@@ -81,9 +102,19 @@ All paths below are under `%LOCALAPPDATA%\UngoogledChromiumUpdater`.
 ## Recover an interrupted installation
 
 1. Keep Chromium closed. Check that the official installer and its setup process have exited. The launcher blocks its own browser starts while `installation.json` exists.
-2. Read the recovery marker and locate its matching backup. Check for `complete.json` in the backup. It records the pre-install browser version. Preserve this copy before any further repair. The backup includes uBlock Origin and extension data even if a separate dashboard export is unavailable.
+2. Read the recovery marker and locate its matching backup. Check `complete.json` for the pre-install browser version and verification scope. Preserve the matching backup before any repair. For a backup with `HashScope` set to `sha256-v1`, use the read-only verification command below. If verification fails, preserve the copy for diagnosis and inspect another completed backup before relying on it. Older backups carry the earlier Robocopy evidence and remain available for manual recovery.
 3. Inspect `chrome.exe` and the registered Chromium version. If installation was incomplete, repair with the same verified or a newer verified official installer while Chromium is closed. Compare the staged installer's tag and SHA-256 with the recovery marker, when available. Check for `new_chrome.exe`, installer errors, and consistent executable and registered versions. Chromium setup may create `chromium_installer.log` in the Windows temporary directory.
 4. After verification, move `installation.json` aside within the private directory. Start through the launcher and verify profiles, extension status and filtering. Keep the recovery marker and backup until validation succeeds.
+
+Use this advanced maintenance command to recheck the backup referenced by the recovery marker. It reports the scoped SHA-256 result and leaves the marker in place.
+
+```powershell
+$updater = Join-Path $env:LOCALAPPDATA 'UngoogledChromiumUpdater'
+$marker = Get-Content -LiteralPath (Join-Path $updater 'installation.json') -Raw | ConvertFrom-Json
+& (Join-Path $updater 'app\Update.ps1') -VerifyBackup $marker.Backup
+```
+
+The command returns 0 when the saved scope matches, 1 when verification fails, and 2 for a legacy backup that has no saved hashes. It verifies the backup on disk without launching Chromium or restoring files.
 
 Restoring an older executable can reintroduce security vulnerabilities and may be incompatible with a migrated profile. If a restore becomes necessary, keep copies of the current state and recover the matching Application and User Data snapshot together, using the same Windows user and the original paths. Check the installer registration and Windows associations before resuming use. The launcher never rolls back automatically.
 

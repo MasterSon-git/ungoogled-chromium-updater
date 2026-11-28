@@ -1,4 +1,5 @@
 $script:WindowsRepo = 'ungoogled-software/ungoogled-chromium-windows'
+$script:BackupNamePattern = '\A\d{8}T\d{6}Z-[a-f0-9]{32}\z'
 
 function Get-BrowserVersion([string]$Path, [string]$Architecture) {
     Assert-LocalPath $Path
@@ -187,7 +188,7 @@ function Get-BrowserArtifact([string]$Root, $Candidate) {
     @{ Path = $file; Signer = $signer }
 }
 
-function Assert-OrdinaryTree([string]$Path) {
+function Assert-OrdinaryTree([string]$Path, [switch]$ListFiles) {
     Assert-LocalPath $Path
     $pending = [Collections.Generic.Stack[string]]::new()
     $pending.Push($Path)
@@ -195,6 +196,7 @@ function Assert-OrdinaryTree([string]$Path) {
         foreach ($item in (Get-ChildItem -LiteralPath $pending.Pop() -Force)) {
             if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'A backup source or destination includes a link or junction.' }
             if ($item.PSIsContainer) { $pending.Push($item.FullName) }
+            elseif ($ListFiles) { $item }
         }
     }
 }
@@ -210,40 +212,149 @@ function Copy-BrowserTree([string]$Source, [string]$Destination) {
     if ($LASTEXITCODE -ne 0) { throw 'Backup verification found a missing or changed file.' }
 }
 
+function Get-BackupProfileFiles([string]$UserData) {
+    Assert-LocalPath $UserData
+    $localState = Join-Path $UserData 'Local State'
+    if (Test-Path -LiteralPath $localState) { Get-Item -LiteralPath $localState -Force }
+    $profileFiles = '\A(?:Preferences|Secure Preferences|Bookmarks(?:\.bak)?|Current (?:Session|Tabs)|Last (?:Session|Tabs))\z'
+    $databases = '\A(?:History|Login Data(?: For Account)?|Web Data|Account Web Data|Cookies)(?:-journal|-wal|-shm)?\z'
+    foreach ($profile in (Get-ChildItem -LiteralPath $UserData -Directory -Force)) {
+        Assert-LocalPath $profile.FullName
+        foreach ($item in (Get-ChildItem -LiteralPath $profile.FullName -Force)) {
+            if (!$item.PSIsContainer -and ($item.Name -match $profileFiles -or $item.Name -match $databases)) {
+                $item
+            } elseif ($item.PSIsContainer -and $item.Name -in 'Extensions','Extension State','Extension Rules','Extension Scripts',
+                'Local Extension Settings','Sync Extension Settings','Managed Extension Settings','Sessions') {
+                Assert-OrdinaryTree $item.FullName -ListFiles
+            } elseif ($item.PSIsContainer -and $item.Name -ieq 'Network') {
+                Assert-LocalPath $item.FullName
+                Get-ChildItem -LiteralPath $item.FullName -File -Force |
+                    Where-Object Name -match '\ACookies(?:-journal|-wal|-shm)?\z'
+            }
+        }
+    }
+}
+
+function Get-BrowserBackupHashes([string]$Application, [string]$UserData) {
+    $hashes = @{}
+    try {
+        $files = @{
+            Application = @(Assert-OrdinaryTree $Application -ListFiles)
+            'User Data' = @(Get-BackupProfileFiles $UserData)
+        }
+        foreach ($tree in $files.Keys) {
+            $source = if ($tree -eq 'Application') { $Application } else { $UserData }
+            foreach ($file in $files[$tree]) {
+                if ([IO.File]::GetAttributes($file.FullName) -band [IO.FileAttributes]::ReparsePoint) { throw 'Unexpected backup link.' }
+                $relative = [IO.Path]::GetRelativePath($source, $file.FullName)
+                $stream = [IO.File]::Open($file.FullName, 'Open', 'Read', 'Read')
+                try { $hashes.Add("$tree\$relative", [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($stream))) }
+                finally { $stream.Dispose() }
+            }
+        }
+    } catch {
+        throw [InvalidOperationException]::new('Backup content could not be read for SHA-256 verification.', $_.Exception)
+    }
+    $hashes
+}
+
+function Assert-BackupHashes($Expected, $Actual) {
+    if ($Expected.Count -ne $Actual.Count) { throw 'Backup SHA-256 verification found missing or changed files.' }
+    foreach ($entry in $Expected.GetEnumerator()) {
+        if ($Actual[$entry.Key] -cne $entry.Value) { throw 'Backup SHA-256 verification found missing or changed files.' }
+    }
+}
+
+function Confirm-BrowserBackup([string]$Root, [string]$Name) {
+    if ($Name -cnotmatch $script:BackupNamePattern) { throw 'Choose a completed backup by its folder name.' }
+    $backup = Join-Path $Root "backups\$Name"
+    $marker = Join-Path $backup 'complete.json'
+    Assert-LocalPath $marker
+    if (![IO.File]::Exists($marker)) { throw 'The completed backup record is missing.' }
+    $record = Read-Json $marker
+    if ($record -isnot [Collections.IDictionary] -or !$record['Version'] -or !$record['Created']) {
+        throw 'The completed backup record is invalid.'
+    }
+    if (!$record.Contains('HashScope') -and !$record.Contains('Hashes')) { return 'Legacy' }
+    if ($record['HashScope'] -cne 'sha256-v1' -or $record['Hashes'] -isnot [Collections.IDictionary] -or !$record['Hashes'].Count) {
+        throw 'The backup SHA-256 record is invalid or unsupported.'
+    }
+    Assert-OrdinaryTree (Join-Path $backup 'User Data')
+    Assert-BackupHashes $record.Hashes (Get-BrowserBackupHashes (Join-Path $backup 'Application') (Join-Path $backup 'User Data'))
+    'Verified'
+}
+
+function Remove-BackupDirectory([string]$Parent, [string]$Name) {
+    if ($Name -cne 'incomplete' -and $Name -cnotmatch $script:BackupNamePattern) { throw 'Unexpected backup directory name.' }
+    $path = [IO.Path]::GetFullPath((Join-Path $Parent $Name))
+    if ([IO.Path]::GetDirectoryName($path) -ine [IO.Path]::GetFullPath($Parent)) {
+        throw 'Backup retention path escaped the backup directory.'
+    }
+    Assert-OrdinaryTree $path
+    Remove-Item -LiteralPath $path -Recurse -Force
+}
+
+function Remove-ExpiredBackups([string]$Root, [string]$NewBackup) {
+    $pending = Join-Path $Root 'installation.json'
+    Assert-LocalPath $pending
+    if (Test-Path -LiteralPath $pending) { throw 'An interrupted installation requires recovery.' }
+    $parent = Join-Path $Root 'backups'
+    Assert-LocalPath $parent
+    $remaining = if ($NewBackup) { 1 } else { 2 }
+    $previous = Get-ChildItem -LiteralPath $parent -Directory -Force | Sort-Object Name -Descending
+    foreach ($dir in $previous) {
+        if ($dir.Name -ceq $NewBackup -or ($dir.Name -cne 'incomplete' -and $dir.Name -cnotmatch $script:BackupNamePattern)) { continue }
+        $marker = Join-Path $dir.FullName 'complete.json'
+        Assert-LocalPath $marker
+        if ($dir.Name -cne 'incomplete' -and $remaining -gt 0 -and [IO.File]::Exists($marker)) {
+            $remaining--
+            continue
+        }
+        Remove-BackupDirectory $parent $dir.Name
+    }
+}
+
 function New-BrowserBackup([string]$Root, $Config, [version]$Version) {
     if (Test-BrowserBusy $Config) { throw 'The browser must be fully closed before the backup.' }
     $parent = Join-Path $Root 'backups'
     Assert-LocalPath $parent
+    [void][IO.Directory]::CreateDirectory($parent)
+    try { Remove-ExpiredBackups $Root }
+    catch { throw [InvalidOperationException]::new('Backup cleanup failed. Review the private backups directory before retrying.', $_.Exception) }
+    $work = Join-Path $parent 'incomplete'
+    Assert-LocalPath $work
+    $application = [IO.Path]::GetDirectoryName($Config.browserPath)
     $name = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '-' + [guid]::NewGuid().ToString('N')
-    $backup = Join-Path $parent $name
-    [void][IO.Directory]::CreateDirectory($backup)
-    Write-Status INFO 'Backing up the browser and its full profile data under the private updater directory.'
-    Copy-BrowserTree ([IO.Path]::GetDirectoryName($Config.browserPath)) (Join-Path $backup 'Application')
-    if (Test-BrowserBusy $Config) { throw 'The browser started during backup. The backup is incomplete.' }
-    Copy-BrowserTree $Config.userData (Join-Path $backup 'User Data')
-    if (Test-BrowserBusy $Config) { throw 'The browser started during backup. The backup is incomplete.' }
-    Write-Json (Join-Path $backup 'complete.json') @{ Version = $Version.ToString(); Created = [DateTimeOffset]::UtcNow.ToString('o') }
-    $name
-}
-
-function Remove-ExpiredBackups([string]$Root, [string]$NewBackup) {
-    $parent = Join-Path $Root 'backups'
-    Assert-LocalPath $parent
-    $previous = @(Get-ChildItem -LiteralPath $parent -Directory |
-        Where-Object { $_.Name -cmatch '^\d{8}T\d{6}Z-[a-f0-9]{32}$' -and $_.Name -ne $NewBackup } |
-        Sort-Object Name -Descending)
-    $keptPrevious = $false
-    foreach ($dir in $previous) {
-        if (!$keptPrevious -and (Test-Path -LiteralPath (Join-Path $dir.FullName 'complete.json'))) {
-            $keptPrevious = $true
-            continue
+    [void][IO.Directory]::CreateDirectory($work)
+    try {
+        Write-Status INFO 'Backing up Application and User Data and hashing the documented recovery files.'
+        $expected = Get-BrowserBackupHashes $application $Config.userData
+        if (Test-BrowserBusy $Config) { throw 'The browser started during backup. Close Chromium and try again.' }
+        $appCopy = Join-Path $work 'Application'
+        $profileCopy = Join-Path $work 'User Data'
+        Copy-BrowserTree $application $appCopy
+        if (Test-BrowserBusy $Config) { throw 'The browser started during backup. Close Chromium and try again.' }
+        Copy-BrowserTree $Config.userData $profileCopy
+        if (Test-BrowserBusy $Config) { throw 'The browser started during backup. Close Chromium and try again.' }
+        Assert-BackupHashes $expected (Get-BrowserBackupHashes $appCopy $profileCopy)
+        Assert-BackupHashes $expected (Get-BrowserBackupHashes $application $Config.userData)
+        if (Test-BrowserBusy $Config) { throw 'The browser started during backup. Close Chromium and try again.' }
+        Write-Json (Join-Path $work 'complete.json') @{
+            Version = $Version.ToString(); Created = [DateTimeOffset]::UtcNow.ToString('o')
+            HashScope = 'sha256-v1'; Hashes = $expected
         }
-        if (![IO.Path]::GetFullPath($dir.FullName).StartsWith("$parent\",[StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Backup retention path escaped the backup directory.'
+        $completed = Join-Path $parent $name
+        Assert-LocalPath $completed
+        [IO.Directory]::Move($work, $completed)
+    } finally {
+        if ([IO.Directory]::Exists($work)) {
+            try { Remove-BackupDirectory $parent 'incomplete' }
+            catch { Write-Status WARN 'The incomplete backup needs cleanup before retrying.' }
         }
-        Assert-OrdinaryTree $dir.FullName
-        Remove-Item -LiteralPath $dir.FullName -Recurse -Force
     }
+    Write-Status ' OK ' "Backup copy passed Robocopy comparison and SHA-256 checks for $($expected.Count) files in the documented scope."
+    try { Remove-ExpiredBackups $Root $name } catch { Write-Status WARN 'Backup retention needs manual attention.' }
+    $name
 }
 
 function Assert-RegisteredInstall($Config, [version]$Version) {
@@ -308,7 +419,6 @@ function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $
     Write-BrowserRelease $Root $Candidate (Get-InstalledBrowserIdentity $Config $Candidate.Version) $Compatibility
     [IO.File]::Delete($pending)
     [IO.File]::Delete($installPreferences)
-    try { Remove-ExpiredBackups $Root $backup } catch { Write-Status WARN 'Backup retention needs manual attention.' }
     'Installed'
 }
 

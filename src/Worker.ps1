@@ -44,6 +44,12 @@ function Get-SafeProblem($ErrorRecord, [string]$Fallback) {
     $reason = $ErrorRecord.Exception.Message
     if ($reason -cmatch ('^The update request timed out\.$|^Update server returned HTTP \d{3}\.$|' +
         '^The Chromium installer exited with code -?\d+\.$|^Backup copy failed or was inconsistent \(Robocopy exit \d+\)\.$|' +
+        '^Backup (?:SHA-256 verification found missing or changed files|verification found a missing or changed file)\.$|' +
+        '^Backup cleanup failed\. Review the private backups directory before retrying\.$|' +
+        '^Backup content could not be read for SHA-256 verification\.$|' +
+        '^The browser started during backup\. Close Chromium and try again\.$|' +
+        '^Choose a completed backup by its folder name\.$|^The completed backup record is (?:missing|invalid)\.$|' +
+        '^The backup SHA-256 record is invalid or unsupported\.$|' +
         '^Windows installer has an invalid Authenticode status\.$|^The Windows installer signer does not match the configured pin\.$|' +
         '^The standing browser policy does not accept this unsigned installer\.$|^Browser installer SHA-256 or byte count mismatch\.$|' +
         '^The installed browser files do not match the verified installer payload\.$|' +
@@ -61,14 +67,14 @@ function Get-CheckStatus([string[]]$Results) {
     'Complete'
 }
 
-function Write-ExtensionStatus($Extension, [string]$Level, [string]$Text) {
+function Write-ExtensionStatus($Extension, [string]$Level, [string]$Text, [string]$Kind = 'Extension') {
     $name = if ($Extension.Manifest) { [string]$Extension.Manifest['name'] } else { $Extension.Id }
     if (!$name -or $name.StartsWith('__MSG_') -or $name -notmatch '^[ -~]{1,90}$') { $name = $Extension.Id }
     $version = if ($Extension.Manifest -and $Extension.Manifest['version'] -match '^\d+(\.\d+){0,3}$') { $Extension.Manifest['version'] } else { 'unknown' }
     $enabled = if ($Extension.Enabled) { 'enabled' } else { 'disabled' }
     $mv = if ($Extension.Manifest -and $Extension.Manifest['manifest_version'] -in 2,3) { "MV$($Extension.Manifest['manifest_version'])" } else { 'MV unknown' }
     $profile = ConvertTo-Json -InputObject ([string]$Extension.Profile) -Compress -EscapeHandling EscapeNonAscii
-    Write-Status $Level "$profile / $name $version ($mv, $enabled): $Text" "Extension $($Extension.Id) $version ($mv, ${enabled}): $Text"
+    Write-Status $Level "$profile / $name $version ($mv, $enabled): $Text" "$Kind $($Extension.Id) $version ($mv, ${enabled}): $Text"
 }
 
 function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previous, [bool]$DeepCheck,
@@ -76,6 +82,7 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
     $statuses = [Collections.Generic.List[string]]::new()
     $candidates = [Collections.Generic.List[object]]::new()
     $needsReview = $false
+    $componentChanges = 0
     $observed = @{}
     $storeIds = @($Inventory | Where-Object { (Get-ExtensionChannel $_ $Config.extensions) -eq 'Store' } | ForEach-Object Id)
     $storeFailure = $false
@@ -95,6 +102,18 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
         $manifest = $extension.Manifest
         $old = $Previous[$key]
         $record = @{ Version = $(if ($manifest) { $manifest['version'] }); Enabled = $extension.Enabled; Location = $extension.Location }
+        if ($channel -ceq 'Component') {
+            $record.Update = 'Component'
+            $observed[$key] = $record
+            if (!$old -or ($old['Update'] -cne 'Component' -and $old['Location'] -notin 5,10)) {
+                Write-ExtensionStatus $extension INFO 'browser-managed component added to inventory' 'Component'
+                $componentChanges++
+            } elseif ($old['Version'] -cne $record.Version -or $old['Enabled'] -ne $record.Enabled -or $old['Location'] -ne $record.Location) {
+                Write-ExtensionStatus $extension INFO 'browser-managed component registration changed' 'Component'
+                $componentChanges++
+            }
+            continue
+        }
         if ($old -and $old['HandoffDigest']) { $record.HandoffDigest = $old['HandoffDigest'] }
         if ($old -and $old['PermissionSchema'] -eq 2) {
             $record.PermissionSchema = 2
@@ -102,7 +121,6 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
         }
         try {
             $outcome = switch ($channel) {
-                Component { @{ Level = 'INFO'; Text = 'built in and serviced with Chromium'; Status = 'Complete'; Update = 'Component' } }
                 Unknown { @{ Level = 'WARN'; Text = 'unapproved source or installation type. Review manually'; Status = 'Action'; Update = 'Discovered' } }
                 LegacyUbo {
                     Assert-ExtensionKey $extension.Id $manifest
@@ -139,7 +157,7 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
             } elseif ($old -and $old.Contains('Enabled') -and $old['Enabled'] -ne $record.Enabled) {
                 Write-ExtensionStatus $extension INFO 'enabled state changed in Chromium'
             }
-            if ($manifest -and $channel -ne 'Component') {
+            if ($manifest) {
                 $permissions = @(Get-ManifestPermissions $manifest)
                 $oldPermissions = $record['Permissions']
                 $changes = if ($record['PermissionSchema'] -eq 2) {
@@ -200,9 +218,16 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
         if (!$observed.ContainsKey($key) -and $key -cmatch '/([a-p]{32})$') {
             $id = $Matches[1]
             $profile = ConvertTo-Json -InputObject $key.Substring(0, $key.Length - 33) -Compress -EscapeHandling EscapeNonAscii
-            Write-Status INFO "$profile / $id is no longer registered in the inventory." "Extension $id is no longer registered in its previous profile."
+            $old = $Previous[$key]
+            if ($old['Update'] -ceq 'Component' -or $old['Location'] -in 5,10) {
+                Write-Status INFO "$profile / browser-managed component $id is no longer registered in the inventory." "Component $id is no longer registered in its previous profile."
+                $componentChanges++
+            } else {
+                Write-Status INFO "$profile / $id is no longer registered in the inventory." "Extension $id is no longer registered in its previous profile."
+            }
         }
     }
+    if ($componentChanges) { Write-Status INFO "Browser-managed component inventory changed in $componentChanges registration(s)." }
     @{ Status = Get-CheckStatus $statuses.ToArray(); Inventory = $observed; Candidates = $candidates.ToArray(); NeedsReview = $needsReview }
 }
 
@@ -476,16 +501,17 @@ function Invoke-Workflow($Root, $Config, $Previous) {
         if ($inventoryReady) { Write-Status INFO 'Reconciling extension registrations after the browser handoff.' }
         $refresh = $null
     }
+    $upstream = @{ Status = 'Unavailable' }
     try {
         $stable = Get-UpstreamStable $Config.architecture
+        $upstream = @{ Status = 'NoGap'; Version = $stable.ToString() }
         Write-Status INFO "Broadly served Google Chrome stable is $stable."
         if ($installed -lt $stable) {
+            $upstream.Status = 'Gap'
             Write-Status WARN "Installed Chromium $installed trails Chrome stable $stable. Review upstream security advisories for the remaining patch gap."
-            $results.Add('Action')
         }
     } catch {
         Write-Status WARN (Get-SafeProblem $_ 'Chrome stable comparison is unavailable. The official Windows release is verified independently.')
-        $results.Add('Action')
     }
     $browserStatus = Get-CheckStatus $results.ToArray()
     $extensions = if ($inventoryReady) {
@@ -501,6 +527,7 @@ function Invoke-Workflow($Root, $Config, $Previous) {
     @{
         Status = Get-CheckStatus $results.ToArray(); Inventory = $extensions.Inventory; InventoryRefresh = $refresh
         Candidates = $extensions['Candidates']; NativeActionOnly = $browserStatus -ceq 'Complete' -and !$extensions['NeedsReview']
+        Upstream = $upstream
     }
 }
 
@@ -574,6 +601,7 @@ function Invoke-UpdateSession([string]$Root) {
         $nextState = @{
             Schema = 1; Day = $now.ToString('yyyy-MM-dd'); Attempt = $now.ToString('o')
             Status = $outcome.Status; UpdaterStatus = $updaterStatus; Inventory = $outcome.Inventory; InventoryRefresh = $refresh
+            Upstream = $outcome['Upstream']
         }
         Write-Json $statePath $nextState
     }
