@@ -31,10 +31,13 @@ function Get-ExtensionInventory([string]$UserData) {
             $entry = $settings[$id]
             $manifest = $entry['manifest']
             $relative = [string]$entry['path']
-            if (!$manifest -and $relative -match "^${id}[/\\][\d_.-]+$") {
-                $path = Join-Path $folder.FullName "Extensions\$relative\manifest.json"
-                Assert-LocalPath $path
-                if (Test-Path -LiteralPath $path) { $manifest = Read-Json $path }
+            $manifestPath = $null
+            if ($relative -cmatch "^${id}[/\\]\d{1,6}(?:\.\d{1,6}){0,3}_\d+$") {
+                $manifestPath = Join-Path $folder.FullName "Extensions\$relative\manifest.json"
+                if (!$manifest) {
+                    Assert-LocalPath $manifestPath
+                    if ([IO.File]::Exists($manifestPath)) { $manifest = Read-Json $manifestPath }
+                }
             }
             $disabled = $entry['state'] -eq 0 -or @($entry['disable_reasons'] | Where-Object { $null -ne $_ -and $_ -ne 0 }).Count -gt 0
             [pscustomobject]@{
@@ -43,6 +46,7 @@ function Get-ExtensionInventory([string]$UserData) {
                 Location = $entry['location']
                 Enabled = !$disabled
                 Manifest = $manifest
+                ManifestPath = $manifestPath
             }
         }
     }
@@ -131,22 +135,49 @@ function Get-ExtensionRelease([string]$Channel) {
     $asset
 }
 
+function ConvertTo-CanonicalManifestValue($Value) {
+    if ($Value -is [Collections.IDictionary]) {
+        [string[]]$keys = @($Value.Keys)
+        [Array]::Sort($keys, [StringComparer]::Ordinal)
+        $result = [ordered]@{}
+        foreach ($key in $keys) { $result[$key] = ConvertTo-CanonicalManifestValue $Value[$key] }
+        return $result
+    }
+    if ($Value -is [array]) {
+        return ,@(foreach ($item in $Value) { ConvertTo-CanonicalManifestValue $item })
+    }
+    $Value
+}
+
 function Get-ManifestPermissions($Manifest) {
     foreach ($key in 'permissions','host_permissions','optional_permissions','optional_host_permissions') {
         foreach ($item in @($Manifest[$key])) {
-            if ($null -ne $item) { "$key=" + (ConvertTo-Json -InputObject $item -Depth 12 -Compress) }
-        }
-    }
-    foreach ($scriptEntry in @($Manifest['content_scripts'])) {
-        if ($null -eq $scriptEntry) { continue }
-        foreach ($field in 'matches','include_globs','exclude_matches','exclude_globs','all_frames','match_about_blank','match_origin_as_fallback','world') {
-            foreach ($item in @($scriptEntry[$field])) {
-                if ($null -ne $item) { "content_scripts.$field=" + (ConvertTo-Json -InputObject $item -Depth 12 -Compress) }
+            if ($null -ne $item) {
+                "$key=" + (ConvertTo-Json -InputObject (ConvertTo-CanonicalManifestValue $item) -Depth 20 -Compress)
             }
         }
     }
-    foreach ($key in 'externally_connectable','oauth2','sandbox','content_security_policy') {
-        if ($Manifest[$key]) { "$key=" + (ConvertTo-Json -InputObject $Manifest[$key] -Depth 12 -Compress) }
+    foreach ($scriptEntry in $Manifest['content_scripts']) {
+        if ($null -eq $scriptEntry) { continue }
+        $rule = [ordered]@{}
+        foreach ($field in 'matches','include_globs','exclude_matches','exclude_globs') {
+            [string[]]$patterns = @($scriptEntry[$field] | Where-Object { $null -ne $_ } | Sort-Object -CaseSensitive -Unique)
+            [Array]::Sort($patterns, [StringComparer]::Ordinal)
+            $rule[$field] = $patterns
+        }
+        foreach ($field in 'js','css') { $rule[$field] = @($scriptEntry[$field] | Where-Object { $null -ne $_ }) }
+        foreach ($field in 'all_frames','match_about_blank','match_origin_as_fallback') {
+            $rule[$field] = $scriptEntry[$field] -eq $true
+        }
+        $rule['world'] = $scriptEntry['world'] ?? 'ISOLATED'
+        $rule['run_at'] = $scriptEntry['run_at'] ?? 'document_idle'
+        'content_scripts=' + (ConvertTo-Json -InputObject $rule -Depth 12 -Compress)
+    }
+    foreach ($key in 'externally_connectable','oauth2','sandbox','content_security_policy','web_accessible_resources',
+        'cross_origin_embedder_policy','cross_origin_opener_policy') {
+        if ($Manifest.Contains($key)) {
+            "$key=" + (ConvertTo-Json -InputObject (ConvertTo-CanonicalManifestValue $Manifest[$key]) -Depth 20 -Compress)
+        }
     }
 }
 
@@ -174,50 +205,119 @@ function Get-VerifiedExtensionPackage($Asset, [string]$Id, [bool]$Store) {
     @{ Manifest = $manifest; Bytes = $bytes; Proof = $verified }
 }
 
-function Get-VerifiedManifest($Asset, [string]$Id, [bool]$Store) {
-    (Get-VerifiedExtensionPackage $Asset $Id $Store).Manifest
-}
-
 function Test-FullUboManifest($Manifest) {
     $Manifest['manifest_version'] -eq 2 -and $Manifest['update_url'] -cin @(
         $script:UboUrl,'https://raw.githubusercontent.com/gorhill/uBlock/master/dist/chromium/update.xml')
 }
 
-function Get-PermissionChanges($Previous, $Candidate) {
-    $old = @(Get-ManifestPermissions $Previous)
-    $new = @(Get-ManifestPermissions $Candidate)
-    $changes = @($new | Where-Object { $_ -cnotin $old })
-    $changes += @($old | Where-Object { $_ -like 'content_scripts.exclude*' -and $_ -cnotin $new })
+function Compare-PermissionSnapshots($Previous, $Candidate, [switch]$Exact) {
+    $old = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $new = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($item in $Previous) { [void]$old.Add($item) }
+    foreach ($item in $Candidate) { [void]$new.Add($item) }
+    $changes = @(foreach ($item in $new) {
+        if (!$old.Contains($item)) { ($item -split '=', 2)[0] }
+    })
+    $changes += @(foreach ($item in $old) {
+        $field = ($item -split '=', 2)[0]
+        if (!$new.Contains($item) -and ($Exact -or $field -cnotin @(
+            'permissions','host_permissions','optional_permissions','optional_host_permissions','content_scripts'))) {
+            $field
+        }
+    })
     $changes | Sort-Object -Unique
 }
 
-function Test-ExtensionCandidate($Extension, [string]$Channel, $Asset, [version]$BrowserVersion, [bool]$VerifyCurrent) {
-    $manifest = $Extension.Manifest
-    Assert-ExtensionKey $Extension.Id $manifest
-    if (!$Asset) { return @{ Level = 'WARN'; Text = 'no verified package is currently offered'; Status = 'Action' } }
-    $offered = Get-Version $Asset.Version
-    $installed = Get-Version $manifest.version
-    if ($offered -lt $installed) { return @{ Level = 'WARN'; Text = 'installed version is newer than the channel offers'; Status = 'Action' } }
-    if ($offered -eq $installed -and !$VerifyCurrent) {
-        return @{ Level = ' OK '; Text = 'current for verified channel'; Status = 'Complete' }
-    }
-    $remote = Get-VerifiedManifest $Asset $Extension.Id ($Channel -eq 'Store')
+function Get-ChannelPackage($Asset, [string]$Id, [string]$Channel, $Packages) {
+    $key = "$Channel/$Id/$($Asset.Version)/$($Asset.Digest)/$($Asset.Size)"
+    if ($Packages.ContainsKey($key)) { return $Packages[$key] }
+    $package = Get-VerifiedExtensionPackage $Asset $Id ($Channel -eq 'Store')
+    $remote = $package.Manifest
     $validChannel = switch ($Channel) {
         Store { $remote['update_url'] -ceq $script:StoreUrl }
         Ubo { Test-FullUboManifest $remote }
         WebStoreHelper { $remote['update_url'] -ceq $script:WebStoreUrl }
     }
     if (!$validChannel) { throw 'Signed package changed its update source or required Manifest version.' }
+    $Packages[$key] = $package
+    $package
+}
+
+function Save-VerifiedExtensionPackage([string]$Root, [string]$Id, $Asset, [byte[]]$Bytes) {
+    if ($Id -cnotmatch '^[a-p]{32}$' -or $Asset.Digest -cnotmatch '^[0-9a-fA-F]{64}$') {
+        throw 'Invalid staged extension identity.'
+    }
+    $version = Get-Version $Asset.Version
+    $directory = Join-Path $Root 'extension-packages'
+    $path = Join-Path $directory "$Id-$version-$($Asset.Digest.ToLowerInvariant()).crx"
+    Assert-LocalPath $path
+    [void][IO.Directory]::CreateDirectory($directory)
+    if (![IO.File]::Exists($path) -or !(Test-ArtifactFile $path $Asset)) {
+        $size = 0L
+        $expired = [DateTime]::UtcNow.AddDays(-7)
+        foreach ($file in (Get-ChildItem -LiteralPath $directory -File -Force)) {
+            if ($file.Attributes -band [IO.FileAttributes]::ReparsePoint -or
+                $file.Name -cnotmatch '^[a-p]{32}-[\d.]+-[a-f0-9]{64}\.crx(?:\.[a-f0-9]{32}\.tmp)?$') { continue }
+            if ($file.LastWriteTimeUtc -lt $expired) { [IO.File]::Delete($file.FullName) }
+            elseif ($file.FullName -ine $path) { $size += $file.Length }
+        }
+        if ($size + $Asset.Size -gt 256MB) { throw 'The private extension package cache is full.' }
+        $temp = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+        try {
+            [IO.File]::WriteAllBytes($temp, $Bytes)
+            if (!(Test-ArtifactFile $temp $Asset)) { throw 'Staged extension package size or SHA-256 mismatch.' }
+            [IO.File]::Move($temp, $path, $true)
+        } finally { [IO.File]::Delete($temp) }
+    }
+    $path
+}
+
+function Test-ExtensionCandidate($Extension, [string]$Channel, $Asset, [version]$BrowserVersion, [bool]$VerifyCurrent,
+    [string]$StageRoot, $Packages = @{}) {
+    $manifest = $Extension.Manifest
+    Assert-ExtensionKey $Extension.Id $manifest
+    if (!$Asset) { return @{ Level = 'WARN'; Text = 'no package is currently offered'; Status = 'Action'; Update = 'Unavailable' } }
+    $offered = Get-Version $Asset.Version
+    $installed = Get-Version $manifest.version
+    if ($offered -lt $installed) {
+        return @{ Level = 'WARN'; Text = 'installed version is newer than the channel offers'; Status = 'Action'; Update = 'Unavailable' }
+    }
+    if ($offered -eq $installed -and !$VerifyCurrent) {
+        return @{ Level = 'INFO'; Text = 'registered version is current in channel metadata'; Status = 'Complete'; Update = 'Current' }
+    }
+    $package = Get-ChannelPackage $Asset $Extension.Id $Channel $Packages
+    $remote = $package.Manifest
     if ($remote['minimum_chrome_version'] -and (Get-Version $remote['minimum_chrome_version']) -gt $BrowserVersion) {
-        return @{ Level = 'WARN'; Text = "$($Asset.Version) requires a newer browser"; Status = 'Action' }
+        return @{ Level = 'WARN'; Text = "$($Asset.Version) verified and requires a newer browser"; Status = 'Action'; Update = 'Verified' }
     }
-    $changes = @(Get-PermissionChanges $manifest $remote)
-    if ($changes.Count -or $manifest.manifest_version -ne $remote.manifest_version) {
-        return @{ Level = 'WARN'; Text = "$($Asset.Version) changes requested permissions or Manifest version. Review before installing"; Status = 'Action' }
+    $changes = @(Compare-PermissionSnapshots (Get-ManifestPermissions $manifest) (Get-ManifestPermissions $remote) -Exact:($offered -eq $installed))
+    if ($manifest.manifest_version -ne $remote.manifest_version) { $changes += 'manifest_version' }
+    if ($offered -eq $installed) {
+        if ($manifest['update_url'] -cne $remote['update_url'] -or $changes.Count) {
+            throw 'Installed manifest source or permissions differ from the signed package.'
+        }
+        if ($Extension.PSObject.Properties['ManifestPath'] -and $Extension.ManifestPath) {
+            Assert-LocalPath $Extension.ManifestPath
+            $onDisk = Read-Json $Extension.ManifestPath
+            if ($onDisk['key']) { Assert-ExtensionKey $Extension.Id $onDisk }
+            if ((Get-Version $onDisk['version']) -ne $installed -or $onDisk['update_url'] -cne $remote['update_url'] -or
+                $onDisk['manifest_version'] -ne $remote['manifest_version'] -or
+                @(Compare-PermissionSnapshots (Get-ManifestPermissions $remote) (Get-ManifestPermissions $onDisk) -Exact).Count) {
+                throw 'Installed extension files differ from the signed manifest evidence.'
+            }
+        }
+        return @{ Level = ' OK '; Text = 'installed ID, version, source and permission fields match the signed channel package'
+            Status = 'Complete'; Update = 'Installed'; Digest = $Asset.Digest }
     }
-    if ($offered -gt $installed) {
-        $backend = if ($Channel -eq 'Store') { 'Chromium Web Store prompt' } else { 'official GitHub CRX and Chromium prompt' }
-        return @{ Level = 'WARN'; Text = "$($Asset.Version) SHA-256 and CRX3 signature verified. Review in $backend"; Status = 'Action' }
+    $outcome = @{ Level = 'WARN'; Text = "$($Asset.Version) SHA-256 and CRX3 signature verified."; Status = 'Action'; Update = 'Verified' }
+    if ($changes.Count) {
+        $outcome.Text += " Review changed permission or scope fields before installing ($($changes -join ', '))."
     }
-    @{ Level = ' OK '; Text = 'installed version matches the signed channel package'; Status = 'Complete' }
+    if ($StageRoot) {
+        $outcome.Path = Save-VerifiedExtensionPackage $StageRoot $Extension.Id $Asset $package.Bytes
+        $outcome.Update = 'Pending'
+        $outcome.Text += if ($Extension.Enabled) { ' Pending installation in Chromium.' }
+            else { ' Pending installation in Chromium. Keep the extension disabled.' }
+    } else { $outcome.Text += ' Run Update.ps1 -Stage to save the verified CRX.' }
+    $outcome
 }

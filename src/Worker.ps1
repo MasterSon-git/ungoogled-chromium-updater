@@ -46,7 +46,9 @@ function Get-SafeProblem($ErrorRecord, [string]$Fallback) {
         '^The Chromium installer exited with code -?\d+\.$|^Backup copy failed or was inconsistent \(Robocopy exit \d+\)\.$|' +
         '^Windows installer has an invalid Authenticode status\.$|^The Windows installer signer does not match the configured pin\.$|' +
         '^The standing browser policy does not accept this unsigned installer\.$|^Browser installer SHA-256 or byte count mismatch\.$|' +
-        '^The installed browser files do not match the verified installer payload\.$')) {
+        '^The installed browser files do not match the verified installer payload\.$|' +
+        '^The private extension package cache is full\.$|^Installed manifest source or permissions differ from the signed package\.$|' +
+        '^Installed extension files differ from the signed manifest evidence\.$')) {
         return "$Fallback $reason"
     }
     $Fallback
@@ -65,10 +67,12 @@ function Write-ExtensionStatus($Extension, [string]$Level, [string]$Text) {
     $version = if ($Extension.Manifest -and $Extension.Manifest['version'] -match '^\d+(\.\d+){0,3}$') { $Extension.Manifest['version'] } else { 'unknown' }
     $enabled = if ($Extension.Enabled) { 'enabled' } else { 'disabled' }
     $mv = if ($Extension.Manifest -and $Extension.Manifest['manifest_version'] -in 2,3) { "MV$($Extension.Manifest['manifest_version'])" } else { 'MV unknown' }
-    Write-Status $Level "$name $version ($mv, $enabled): $Text" "Extension $($Extension.Id) $version ($mv, ${enabled}): $Text"
+    $profile = ConvertTo-Json -InputObject ([string]$Extension.Profile) -Compress -EscapeHandling EscapeNonAscii
+    Write-Status $Level "$profile / $name $version ($mv, $enabled): $Text" "Extension $($Extension.Id) $version ($mv, ${enabled}): $Text"
 }
 
-function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previous, [bool]$DeepCheck) {
+function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previous, [bool]$DeepCheck,
+    [string]$StageRoot, $Compatibility, [bool]$Refresh, $TestedUboAsset) {
     $statuses = [Collections.Generic.List[string]]::new()
     $observed = @{}
     $storeIds = @($Inventory | Where-Object { (Get-ExtensionChannel $_ $Config.extensions) -eq 'Store' } | ForEach-Object Id)
@@ -79,29 +83,38 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
         $statuses.Add('Failed')
         $storeFailure = $true
     }
-    $releases = @{}
-    foreach ($extension in $Inventory) {
+    $releases = @{ Ubo = $TestedUboAsset }
+    $packages = @{}
+    $lastId = $null
+    foreach ($extension in ($Inventory | Sort-Object Id)) {
+        if ($extension.Id -cne $lastId) { $packages.Clear(); $lastId = $extension.Id }
         $channel = Get-ExtensionChannel $extension $Config.extensions
         $key = $extension.Profile + '/' + $extension.Id
         $manifest = $extension.Manifest
-        $record = if ($manifest) {
-            @{ Version = $manifest['version']; Permissions = @(Get-ManifestPermissions $manifest) }
-        }
         $old = $Previous[$key]
+        $record = @{ Version = $(if ($manifest) { $manifest['version'] }); Enabled = $extension.Enabled; Location = $extension.Location }
+        if ($old -and $old['PermissionSchema'] -eq 2) {
+            $record.PermissionSchema = 2
+            $record.Permissions = $old['Permissions']
+        }
         try {
             $outcome = switch ($channel) {
-                Component { @{ Level = 'INFO'; Text = 'built in and serviced with Chromium'; Status = 'Complete' } }
-                Unknown { @{ Level = 'WARN'; Text = 'unapproved source or installation type. Review manually'; Status = 'Action' } }
+                Component { @{ Level = 'INFO'; Text = 'built in and serviced with Chromium'; Status = 'Complete'; Update = 'Component' } }
+                Unknown { @{ Level = 'WARN'; Text = 'unapproved source or installation type. Review manually'; Status = 'Action'; Update = 'Discovered' } }
                 LegacyUbo {
                     Assert-ExtensionKey $extension.Id $manifest
                     if (!$releases['Ubo']) { $releases['Ubo'] = Get-ExtensionRelease 'Ubo' }
                     $asset = $releases['Ubo']
-                    $signed = Get-VerifiedManifest $asset $script:UboId $false
-                    if (!(Test-FullUboManifest $signed)) {
-                        throw 'Unexpected Manifest version or source for full uBlock Origin.'
+                    $record.Offered = $asset.Version
+                    $package = Get-ChannelPackage $asset $script:UboId 'Ubo' $packages
+                    $migration = @{ Level = 'WARN'; Status = 'Action'; Update = 'Verified'
+                        Text = "Legacy Store ID. Signed full uBlock Origin $($asset.Version) uses a new ID. See the backup and migration procedure." }
+                    if ($StageRoot -and (!$package.Manifest['minimum_chrome_version'] -or
+                        (Get-Version $package.Manifest['minimum_chrome_version']) -le $Installed)) {
+                        $migration.Path = Save-VerifiedExtensionPackage $StageRoot $script:UboId $asset $package.Bytes
+                        $migration.Update = 'Pending'
                     }
-                    $review = if (@(Get-PermissionChanges $manifest $signed).Count) { ' Review changed permissions.' } else { '' }
-                    @{ Level = 'WARN'; Text = "legacy Store ID. Signed full uBlock Origin $($asset.Version) is available via GitHub. Export and migrate in the browser.$review"; Status = 'Action' }
+                    $migration
                 }
                 default {
                     if ($channel -eq 'Store') {
@@ -111,23 +124,68 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
                         if (!$releases[$channel]) { $releases[$channel] = Get-ExtensionRelease $channel }
                         $asset = $releases[$channel]
                     }
-                    $changed = $old -and $old['Version'] -ne $record.Version
-                    Test-ExtensionCandidate $extension $channel $asset $Installed ($DeepCheck -or $changed)
+                    if ($asset) { $record.Offered = $asset.Version }
+                    $verify = $DeepCheck -or !$old -or $old['Version'] -cne $record.Version -or
+                        $old['Update'] -in 'Pending','Verified','Failed' -or
+                        ($channel -eq 'Ubo' -and $Compatibility -and $Compatibility.UboVersion -ceq $record.Version)
+                    Test-ExtensionCandidate $extension $channel $asset $Installed $verify $StageRoot $packages
                 }
             }
-            if ($record -and $old -and @($record.Permissions | Where-Object { $_ -cnotin $old['Permissions'] }).Count) {
-                Write-ExtensionStatus $extension WARN 'new permissions observed in the installed manifest. Review in Chromium'
-                $statuses.Add('Action')
-                $record = $old
+            if (!$old -and ($Previous.Count -or $Refresh)) {
+                Write-ExtensionStatus $extension INFO 'discovered in this profile'
+            } elseif ($old -and $old.Contains('Enabled') -and $old['Enabled'] -ne $record.Enabled) {
+                Write-ExtensionStatus $extension INFO 'enabled state changed in Chromium'
+            }
+            if ($manifest -and $channel -ne 'Component') {
+                $permissions = @(Get-ManifestPermissions $manifest)
+                $oldPermissions = $record['Permissions']
+                $changes = if ($record['PermissionSchema'] -eq 2) {
+                    @(Compare-PermissionSnapshots $oldPermissions $permissions)
+                } elseif ($old -and $old.Contains('Permissions')) {
+                    # Legacy snapshots can still detect added API and host permissions.
+                    $prefix = '^(permissions|host_permissions|optional_permissions|optional_host_permissions)='
+                    @(Compare-PermissionSnapshots ($old['Permissions'] -cmatch $prefix) ($permissions -cmatch $prefix))
+                }
+                if ($changes) {
+                    Write-ExtensionStatus $extension WARN "changed permission or scope fields observed in Chromium ($($changes -join ', ')). Review in Chromium."
+                    $statuses.Add('Action')
+                    if ($record['PermissionSchema'] -ne 2) { $record.Permissions = $old['Permissions'] }
+                } else {
+                    $record.PermissionSchema = 2
+                    $record.Permissions = $permissions
+                }
             }
             Write-ExtensionStatus $extension $outcome.Level $outcome.Text
-            $statuses.Add($outcome.Status)
+            if ($outcome['Path']) {
+                $instruction = if ($channel -eq 'LegacyUbo') { 'Follow the documented ID migration procedure with this verified CRX' }
+                    else { 'In this profile, open this verified CRX through the native Chromium install prompt' }
+                Write-Status INFO "$instruction`n$($outcome.Path)" 'The exact verified extension package is available in private storage.'
+            }
         } catch {
             Write-ExtensionStatus $extension ERROR (Get-SafeProblem $_ 'channel, manifest or package verification failed. Review the trusted source before installing')
-            $statuses.Add('Failed')
-            if ($old) { $record = $old }
+            $outcome = @{ Status = 'Failed'; Update = 'Failed' }
+            if ($old -and $old.Contains('Permissions')) { $record.Permissions = $old['Permissions'] }
         }
-        if ($record) { $observed[$key] = $record }
+        $record.Update = $outcome.Update
+        $statuses.Add($outcome.Status)
+        $observed[$key] = $record
+        if ($Compatibility -and $extension.Id -cin $script:UboId,$script:OldUboId) {
+            $tested = $Compatibility.UboVersion
+            if ($channel -eq 'Ubo' -and $outcome.Update -ceq 'Installed' -and
+                $record.Version -ceq $tested -and $outcome.Digest -ieq $Compatibility.UboDigest) {
+                Write-ExtensionStatus $extension ' OK ' "installed ID and version match the tested Chromium and full uBlock Origin $tested combination. The gate tested unpacked filtering."
+            } else {
+                Write-ExtensionStatus $extension WARN "tested full uBlock Origin $tested differs from the installed or verified extension evidence ($($outcome.Update)). The installed combination is unverified."
+                $statuses.Add('Action')
+            }
+        }
+    }
+    foreach ($key in ($Previous.Keys | Sort-Object)) {
+        if (!$observed.ContainsKey($key) -and $key -cmatch '/([a-p]{32})$') {
+            $id = $Matches[1]
+            $profile = ConvertTo-Json -InputObject $key.Substring(0, $key.Length - 33) -Compress -EscapeHandling EscapeNonAscii
+            Write-Status INFO "$profile / $id is no longer registered in the inventory." "Extension $id is no longer registered in its previous profile."
+        }
     }
     @{ Status = Get-CheckStatus $statuses.ToArray(); Inventory = $observed }
 }
@@ -160,6 +218,9 @@ function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [
         return @{ Status = $status; Version = $Installed }
     }
     $status = 'Action'
+    $compatibility = $null
+    $applied = $false
+    $testedUboAsset = $null
     if ($CheckOnly -or $Stage -or !$InventoryReady) {
         Write-Status WARN 'A newer official Windows release is available.'
     } elseif ($Config.browserUpdateMode -eq 'Manual' -and
@@ -183,21 +244,28 @@ function Invoke-BrowserUpdate($Root, $Config, [version]$Installed, $Candidate, [
             $status = Write-CompatibilityResult $test $installInventory
             if ($status -ne 'Complete') { return @{ Status = $status; Version = $Installed } }
             $payload = $test.Files
+            if ($test['UboVersion'] -and $test['UboDigest']) {
+                $compatibility = @{ UboVersion = $test.UboVersion; UboDigest = $test.UboDigest }
+                $testedUboAsset = $test['UboAsset']
+            }
         }
         if (!$hasMv2 -and (Test-Mv2Needed @(Get-ExtensionInventory $Config.userData))) {
             Write-Status WARN 'The profile now requires an MV2 compatibility check. Retry the browser update.'
             return @{ Status = 'Deferred'; Version = $Installed }
         }
-        if ((Install-BrowserCandidate $Root $Config $Installed $Candidate $artifact $payload) -eq 'Deferred') {
+        if ((Install-BrowserCandidate $Root $Config $Installed $Candidate $artifact $payload $compatibility) -eq 'Deferred') {
             Write-Status WARN 'Browser update deferred. Close Chromium manually before the next installation attempt.'
             $status = 'Deferred'
+            $compatibility = $null
+            $testedUboAsset = $null
         } else {
             $Installed = $Candidate.Version
+            $applied = $true
             Write-Status ' OK ' "Installed and verified Windows distribution release $($Candidate.Tag)."
             $status = 'Complete'
         }
     }
-    @{ Status = $status; Version = $Installed }
+    @{ Status = $status; Version = $Installed; Applied = $applied; Compatibility = $compatibility; TestedUboAsset = $testedUboAsset }
 }
 
 function Write-CompatibilityResult($Test, $Inventory) {
@@ -208,7 +276,8 @@ function Write-CompatibilityResult($Test, $Inventory) {
             if ($extension.Id -notin $script:UboId,$script:OldUboId) { continue }
             $version = if ($extension.Manifest) { $extension.Manifest['version'] }
             try {
-                if ((Get-Version $version) -ne $tested) { $version }
+                $observedVersion = Get-Version $version
+                if ($extension.Id -cne $script:UboId -or $observedVersion -ne $tested) { $version }
             } catch { 'unknown' }
         }
         if ($different) {
@@ -237,6 +306,8 @@ function Invoke-Workflow($Root, $Config, $Previous) {
     }
     $inventory = @()
     $inventoryReady = $false
+    $refresh = $Previous['InventoryRefresh']
+    $update = @{}
     try {
         $inventory = @(Get-ExtensionInventory $Config.userData)
         $inventoryReady = $true
@@ -250,9 +321,25 @@ function Invoke-Workflow($Root, $Config, $Previous) {
         $update = Invoke-BrowserUpdate $Root $Config $installed $candidate $inventoryReady $inventory
         $installed = $update.Version
         $results.Add($update.Status)
+        if ($update['Applied']) {
+            $refresh = 'AwaitingLaunch'
+            Write-Status INFO 'Refreshing the extension inventory after browser installation. Startup changes will be checked after the next launcher handoff.'
+            $inventoryReady = $false
+            try {
+                $inventory = @(Get-ExtensionInventory $Config.userData)
+                $inventoryReady = $true
+            } catch {
+                Write-Status ERROR 'Post-install extension inventory could not be read. The prior inventory is retained for the next check.'
+                $results.Add('Failed')
+            }
+        }
     } catch {
         Write-Status ERROR (Get-SafeProblem $_ 'Browser update check or installation failed. Review download verification and recovery instructions.')
         $results.Add('Failed')
+    }
+    if ($refresh -ceq 'Pending') {
+        if ($inventoryReady) { Write-Status INFO 'Reconciling extension registrations after the browser handoff.' }
+        $refresh = $null
     }
     try {
         $stable = Get-UpstreamStable $Config.architecture
@@ -266,10 +353,16 @@ function Invoke-Workflow($Root, $Config, $Previous) {
         $results.Add('Action')
     }
     $extensions = if ($inventoryReady) {
-        Invoke-ExtensionChecks $inventory $Config $installed $Previous.Inventory $VerifyCurrent
+        $stageRoot = if (!$CheckOnly) { $Root }
+        $compatibility = $update['Compatibility']
+        if (!$compatibility -and @($inventory | Where-Object { $_.Id -cin $script:UboId,$script:OldUboId }).Count) {
+            $compatibility = Get-InstalledMv2Evidence $Root $Config $installed
+        }
+        Invoke-ExtensionChecks $inventory $Config $installed $Previous.Inventory $VerifyCurrent $stageRoot $compatibility (
+            $update['Applied'] -or $Previous['InventoryRefresh'] -ceq 'Pending') $update['TestedUboAsset']
     } else { @{ Status = 'Failed'; Inventory = $Previous.Inventory } }
     $results.Add($extensions.Status)
-    @{ Status = Get-CheckStatus $results.ToArray(); Inventory = $extensions.Inventory }
+    @{ Status = Get-CheckStatus $results.ToArray(); Inventory = $extensions.Inventory; InventoryRefresh = $refresh }
 }
 
 function Invoke-UpdateSession([string]$Root) {
@@ -278,7 +371,8 @@ function Invoke-UpdateSession([string]$Root) {
     $statePath = Join-Path $Root 'state.json'
     $config = Read-Config $root
     $state = Read-DailyState $statePath
-    $forceCheck = $Force -or $CheckOnly -or $Apply -or $Stage -or $VerifyCurrent -or $SelfUpdateOutcome
+    $forceCheck = $Force -or $CheckOnly -or $Apply -or $Stage -or $VerifyCurrent -or $SelfUpdateOutcome -or
+        $state['InventoryRefresh'] -ceq 'Pending'
     $due = Test-Due $state ([DateTimeOffset]::Now) $forceCheck
     $recover = Test-Path -LiteralPath $pending
     if ($Dispatch -and ($due -or $recover)) { return 10 }
@@ -291,7 +385,14 @@ function Invoke-UpdateSession([string]$Root) {
         return 1
     }
     if (!$due) {
-        if (!$NoLaunch) { Start-Chromium $config $BrowserArguments }
+        if (!$NoLaunch) {
+            if ($state['InventoryRefresh'] -ceq 'AwaitingLaunch' -and
+                !(@($config.browserArgs) + $BrowserArguments -match '^--user-data-dir(?:=|$)')) {
+                $state.InventoryRefresh = 'Pending'
+                Write-Json $statePath $state
+            }
+            Start-Chromium $config $BrowserArguments
+        }
         return 0
     }
     if (!$CheckOnly -and !$Stage) { Enable-Log $root }
@@ -319,11 +420,17 @@ function Invoke-UpdateSession([string]$Root) {
         }
     }
     $outcome = Invoke-Workflow $root $config $state
+    $launch = !$NoLaunch -and !$CheckOnly -and !$Stage -and !(Test-Path -LiteralPath $pending)
+    $refresh = $outcome['InventoryRefresh']
+    if ($launch -and $refresh -ceq 'AwaitingLaunch' -and
+        !(@($config.browserArgs) + $BrowserArguments -match '^--user-data-dir(?:=|$)')) {
+        $refresh = 'Pending'
+    }
     if (!$CheckOnly -and !$Stage) {
         $now = [DateTimeOffset]::Now
         Write-Json $statePath @{
             Schema = 1; Day = $now.ToString('yyyy-MM-dd'); Attempt = $now.ToString('o')
-            Status = $outcome.Status; UpdaterStatus = $updaterStatus; Inventory = $outcome.Inventory
+            Status = $outcome.Status; UpdaterStatus = $updaterStatus; Inventory = $outcome.Inventory; InventoryRefresh = $refresh
         }
     }
     switch ($outcome.Status) {
@@ -332,7 +439,7 @@ function Invoke-UpdateSession([string]$Root) {
         Deferred { Write-Status WARN 'Update check completed with deferred work.' }
         Failed { Write-Status ERROR 'Update check did not complete successfully.' }
     }
-    if (!$NoLaunch -and !$CheckOnly -and !$Stage -and !(Test-Path -LiteralPath $pending)) {
+    if ($launch) {
         Start-Chromium $config $BrowserArguments
     }
     if ($outcome.Status -eq 'Failed') { return 1 }

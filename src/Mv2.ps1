@@ -215,7 +215,7 @@ function Get-BrowserCompatibility([string]$Root, $Candidate, $Artifact, [bool]$N
                     $cache['Files']["$($Candidate.Version)\chrome.dll"]) {
                     if (!(Test-ArtifactFile $Artifact.Path $Candidate)) { throw 'The staged installer no longer matches the cached test.' }
                     return @{ Status = 'Pass'; Detail = 'Exact artifact identities match a prior successful MV2 test.'
-                        Files = $cache.Files; UboVersion = $uboAsset.Version }
+                        Files = $cache.Files; UboVersion = $uboAsset.Version; UboDigest = $uboAsset.Digest; UboAsset = $uboAsset }
                 }
             }
         }
@@ -227,6 +227,8 @@ function Get-BrowserCompatibility([string]$Root, $Candidate, $Artifact, [bool]$N
             if (!(Test-FullUboManifest $ubo.Manifest)) { throw 'The verified uBlock Origin manifest changed its source or Manifest version.' }
             $result = Invoke-Mv2Fixture $lab $payload.Exe $ubo $run
             $result.UboVersion = $uboAsset.Version
+            $result.UboDigest = $uboAsset.Digest
+            $result.UboAsset = $uboAsset
         } else { $result = @{ Status = 'Pass'; Detail = 'Verified the exact same-version installer payload.' } }
     } catch [NotSupportedException] {
         $result = @{ Status = 'Inconclusive'; Detail = $_.Exception.Message }
