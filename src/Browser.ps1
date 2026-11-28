@@ -346,6 +346,18 @@ function Test-RegularChromiumLaunch($Switches) {
     $true
 }
 
+function Get-ChromiumHandoffScope($Config, [string[]]$Arguments) {
+    $switches = Get-ChromiumSwitches (@($Config.browserArgs) + $Arguments)
+    if (!(Test-RegularChromiumLaunch $switches)) { return }
+    $data = [IO.Path]::TrimEndingDirectorySeparator($Config.userData)
+    $requested = if ($switches.ContainsKey('user-data-dir')) { $switches['user-data-dir'] }
+        else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Chromium\User Data' }
+    if ($requested -and [IO.Path]::IsPathFullyQualified($requested) -and
+        [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($requested)) -ieq $data) {
+        @{ Data = $data; Switches = $switches }
+    }
+}
+
 function Test-ChromiumExtensionPrompt([string]$UserData, $Switches) {
     $saved = @()
     if (!$Switches.ContainsKey('no-experiments')) {

@@ -15,6 +15,9 @@ using System.Windows.Forms;
 
 internal static class Launcher
 {
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern short GetAsyncKeyState(int virtualKey);
+
     [STAThread]
     private static void Main(string[] args)
     {
@@ -30,14 +33,18 @@ internal static class Launcher
             dispatch.UseShellExecute = false;
             dispatch.CreateNoWindow = true;
             dispatch.WorkingDirectory = Environment.CurrentDirectory;
-            using (Process worker = Process.Start(dispatch))
+            bool extensionActions = GetAsyncKeyState((int)Keys.ShiftKey) < 0;
+            if (!extensionActions)
             {
-                worker.WaitForExit();
-                if (worker.ExitCode == 0) return;
-                if (worker.ExitCode != 10) throw new InvalidOperationException();
+                using (Process worker = Process.Start(dispatch))
+                {
+                    worker.WaitForExit();
+                    if (worker.ExitCode == 0) return;
+                    if (worker.ExitCode != 10) throw new InvalidOperationException();
+                }
             }
 
-            var visible = new ProcessStartInfo(shell, command + " -Interactive");
+            var visible = new ProcessStartInfo(shell, command + " -Interactive" + (extensionActions ? " -ExtensionActions" : ""));
             visible.UseShellExecute = true;
             visible.WindowStyle = ProcessWindowStyle.Normal;
             visible.WorkingDirectory = Environment.CurrentDirectory;

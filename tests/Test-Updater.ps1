@@ -533,7 +533,7 @@ try {
         [void][IO.Directory]::CreateDirectory($data)
         $statePath = Join-Path $root 'handoff-state.json'
         $exe = Join-Path $root 'chrome.exe'
-        $fixture = @{ Prompt = $true; Owner = 42; Calls = [Collections.Generic.List[object]]::new() }
+        $fixture = @{ Prompt = $true; Owner = 42; FailLaunch = $false; Calls = [Collections.Generic.List[object]]::new() }
         $fixtureConfig = @{ userData = $data; browserPath = $exe; browserArgs = @("--user-data-dir=$data"); extensions = @{} }
         $versions = @{ version = '1.1'; manifest_version = 2; update_url = $script:UboUrl }
         $helperManifest = @{ version = '1.1'; manifest_version = 3; update_url = $script:WebStoreUrl }
@@ -564,11 +564,16 @@ try {
             foreach ($c in ($candidates | Where-Object Path -cin $Arguments)) {
                 Assert-Equal $saved.Inventory[$c.Key].HandoffDigest $c.Asset.Digest
             }
+            if ($fixture.FailLaunch) { throw 'Fixture process creation failed.' }
             $fixture.Calls.Add($Arguments)
         }
         $fixture.Prompt = $false
         Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $false) $false
         Assert-Equal $fixture.Calls.Count 0
+        $queued = Read-Json $statePath
+        Assert-Equal $queued.Inventory[$candidates[0].Key].AwaitingPromptDigest $candidates[0].Asset.Digest
+        Assert-Equal (Test-RequestedExtensionUpdates $queued.Inventory) $false
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $false) $true
         $fixture.Prompt = $true
         Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @('--user-data-dir=C:\other') $candidates $state $statePath $false) $false
         Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @('--incognito') $candidates $state $statePath $false) $false
@@ -585,13 +590,155 @@ try {
         Assert-Equal $state.Inventory[$candidates[0].Key].Update 'Pending'
         Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $false) $true
         Assert-Equal $fixture.Calls.Count 2
+        $first = $candidates[0]
+        $fixture.Prompt = $false
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() @($first) $state $statePath $true) $false
+        Assert-Equal $state.Inventory[$first.Key].AwaitingPromptDigest $first.Asset.Digest
+        Assert-Equal $state.Inventory[$first.Key].HandoffDigest $first.Asset.Digest
+        $fixture.Prompt = $true
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() @($first) $state $statePath $false) $true
+        Assert-Equal $fixture.Calls.Count 3
         # A registered version change and a corrupt CRX both block a handoff.
         [IO.File]::WriteAllBytes($candidates[1].Path, [byte[]]@(10))
         $inventory[2].Manifest.version = '1.2'
         Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $true) $false
-        Assert-Equal $fixture.Calls.Count 3
-        Assert-Equal $fixture.Calls[2].Count 3
-        Assert-Equal $fixture.Calls[2][2] $candidates[0].Path
+        Assert-Equal $fixture.Calls.Count 4
+        Assert-Equal $fixture.Calls[3].Count 3
+        Assert-Equal $fixture.Calls[3][2] $first.Path
+        $fixture.FailLaunch = $true
+        $state.Inventory[$first.Key].Remove('HandoffDigest')
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() @($first) $state $statePath $false) $false
+        $saved = Read-Json $statePath
+        Assert-Equal $saved.Inventory[$first.Key]['HandoffDigest'] $null
+        Assert-Equal $saved.Inventory[$first.Key]['AwaitingPromptDigest'] $null
+        Assert-Equal (Test-RequestedExtensionUpdates @{ First = $saved.Inventory[$first.Key] }) $false
+    }
+
+    Test-Case 'missing prompt setting resumes verified handoff before the daily check is due' {
+        $isolated = Join-Path $root 'prompt-resume'
+        [void][IO.Directory]::CreateDirectory($isolated)
+        $localState = Join-Path $isolated 'Local State'
+        Write-Json $localState @{ browser = @{ enabled_labs_experiments = @() } }
+        $fixture = @{ Checks = 0; BrowserStarts = 0; Handoffs = 0; Messages = [Collections.Generic.List[string]]::new() }
+        $fixtureConfig = @{ userData = $isolated; architecture = 'x64'; browserPath = 'fixture'; selfUpdateEnabled = $false
+            browserArgs = @("--user-data-dir=$isolated"); extensions = @{} }
+        $version = [version]'158.0.8127.88'
+        $bytes = [byte[]]@(0, 1, 2)
+        $asset = @{ Version = '1.77.4'; Size = $bytes.Length
+            Digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) }
+        $manifest = @{ version = '1.77.2'; manifest_version = 2; update_url = $script:UboUrl }
+        $remote = $manifest.Clone()
+        $remote.version = $asset.Version
+        $key = "Default/$script:UboId"
+        function Read-Config { $fixtureConfig }
+        function Get-BrowserVersion { $version }
+        function Get-WindowsCandidate { $fixture.Checks++; @{ Tag = "$version-1"; Version = $version } }
+        function Invoke-BrowserUpdate { @{ Status = 'Complete'; Version = $version } }
+        function Get-UpstreamStable { $version }
+        function Get-StoreUpdates { @{} }
+        function Get-ExtensionRelease { $asset }
+        function Get-VerifiedExtensionPackage { @{ Manifest = $remote; Bytes = $bytes } }
+        function Assert-ExtensionKey { }
+        function Get-ExtensionInventory {
+            [pscustomobject]@{ Id = $script:UboId; Profile = 'Default'; Manifest = $manifest; Enabled = $true; Location = 1 }
+        }
+        function Find-ReadyChromium { 42 }
+        function Get-RunningChromiumSwitches { @{} }
+        function Set-UpdaterShortcut { }
+        function Write-Status($Level, $Message) { $fixture.Messages.Add($Message) }
+        function Start-Chromium($Config, $Arguments) {
+            if (@($Arguments).Count -eq 3) { $fixture.Handoffs++ } else { $fixture.BrowserStarts++ }
+        }
+        $statePath = Join-Path $isolated 'state.json'
+        Assert-Equal (Invoke-UpdateSession $isolated) 2
+        $waiting = Read-DailyState $statePath
+        Assert-Equal $waiting.Inventory[$key].AwaitingPromptDigest $asset.Digest
+        Assert-Equal (Test-Due $waiting ([DateTimeOffset]::Now) $false) $false
+        Assert-Equal $fixture.Handoffs 0
+        Assert-Equal @($fixture.Messages -like '*Always prompt for install*relaunch Chromium*').Count 1
+        Assert-Equal @($fixture.Messages -like '*-Force*').Count 0
+        $Dispatch = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        Assert-Equal $fixture.Checks 1
+        Assert-Equal $fixture.BrowserStarts 2
+        Write-Json $localState @{ browser = @{ enabled_labs_experiments = @('extension-mime-request-handling@2') } }
+        $BrowserArguments = @('--incognito')
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        $BrowserArguments = @()
+        Assert-Equal (Invoke-UpdateSession $isolated) 10
+        Assert-Equal $fixture.Checks 1
+        $Dispatch = $false
+        $Interactive = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 21
+        Assert-Equal $fixture.Checks 2
+        Assert-Equal $fixture.Handoffs 1
+        $submitted = Read-DailyState $statePath
+        Assert-Equal $submitted.Inventory[$key]['AwaitingPromptDigest'] $null
+        Assert-Equal $submitted.Inventory[$key].HandoffDigest $asset.Digest
+        Assert-Equal (Test-RequestedExtensionUpdates $submitted.Inventory) $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        Assert-Equal $fixture.Handoffs 1
+    }
+
+    Test-Case 'extension actions offer an opt-in retry for previously submitted updates' {
+        $fixture = @{ Answer = 'R'; Reads = 0 }
+        function Read-Host([string]$Prompt) {
+            Assert-Equal ($Prompt -like '*press Enter to continue*') $true
+            $fixture.Reads++
+            $fixture.Answer
+        }
+        $digest = 'a' * 64
+        $record = @{ Update = 'Pending'; OfferedDigest = $digest; AwaitingPromptDigest = $digest }
+        $state = @{ Inventory = @{ 'Default/fixture' = $record } }
+        Assert-Equal (Read-ExtensionRetryChoice $state) $false
+        Assert-Equal $fixture.Reads 0
+        $record.Remove('AwaitingPromptDigest')
+        $record.HandoffDigest = $digest
+        Assert-Equal (Read-ExtensionRetryChoice $state) $true
+        $fixture.Answer = ''
+        Assert-Equal (Read-ExtensionRetryChoice $state) $false
+        Assert-Equal $fixture.Reads 2
+        $record.OfferedDigest = 'b' * 64
+        Assert-Equal (Test-RequestedExtensionUpdates $state.Inventory) $false
+    }
+
+    Test-Case 'the console choice reaches the normal launcher once and only when requested' {
+        $isolated = Join-Path $root 'retry-console'
+        [void](New-PrivateRoot $isolated)
+        $now = [DateTimeOffset]::Now
+        Write-Json (Join-Path $isolated 'state.json') @{
+            Schema = 1; Status = 'Action'; Day = $now.ToString('yyyy-MM-dd'); Attempt = $now.ToString('o')
+            Inventory = @{ 'Default/fixture' = @{ Update = 'Pending'; HandoffDigest = 'a' * 64 } }
+        }
+        [IO.File]::WriteAllText((Join-Path $isolated 'Worker.ps1'), @'
+function Invoke-UpdateSession([string]$Root) {
+    $fixture.Retries.Add([bool]$RetryExtensionUpdates)
+    0
+}
+'@)
+        $fixture = @{ Reads = 0; Answer = ''; Retries = [Collections.Generic.List[bool]]::new() }
+        function Get-UpdaterRoot { $isolated }
+        function Get-UpdaterSlot { @{ Directory = $isolated } }
+        function Read-Host {
+            $lock = Enter-UpdateLock $isolated
+            if (!$lock) { throw 'The retry choice should run outside the updater lock.' }
+            $lock.Dispose()
+            $fixture.Reads++
+            $fixture.Answer
+        }
+        $Interactive = $true
+        Assert-Equal (Invoke-Launcher) 0
+        Assert-Equal $fixture.Reads 0
+        $ExtensionActions = $true
+        Assert-Equal (Invoke-Launcher) 0
+        $fixture.Answer = 'R'
+        Assert-Equal (Invoke-Launcher) 0
+        Assert-Equal $fixture.Reads 2
+        Assert-Equal ($fixture.Retries -join ',') 'False,False,True'
+        $RetryExtensionUpdates = $true
+        Assert-Equal (Invoke-Launcher) 0
+        Assert-Equal $fixture.Reads 2
+        Assert-Equal $fixture.Retries[3] $true
     }
 
     Test-Case 'normal browser invocation keeps its arguments and precedes extension handoff' {
