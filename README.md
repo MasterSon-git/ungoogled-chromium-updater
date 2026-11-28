@@ -32,7 +32,7 @@ Automatic updater releases require a maintainer-approved public signing pin in t
 
 ## Launch and check
 
-Start Chromium from **Chromium Updater**, its taskbar pin, or an integrated Desktop or Start menu shortcut. The first applicable launch on each Windows local day shows a color-coded console. The launcher starts Chromium after the check. A complete check is reused for the rest of the local day. Deferred work retries after 15 minutes, failures after 30 minutes, and items requiring review after two hours. A new day or a forced check bypasses those intervals. Warnings that need your attention stay visible until acknowledged.
+Start Chromium from **Chromium Updater**, its taskbar pin, or an integrated Desktop or Start menu shortcut. The first applicable launch on each Windows local day shows a color-coded console. The launcher starts Chromium after the check. A complete check is reused for the rest of the local day. An upstream patch gap is shown as an advisory and keeps that daily schedule. Deferred work retries after 15 minutes, failures after 30 minutes, and items requiring review after two hours. A new day or a forced check bypasses those intervals. Warnings that need your attention stay visible until acknowledged. [Notifications and logs](docs/maintenance.md#notifications-and-logs)
 
 If the updater asks for **Always prompt for install**, enable it in Chromium and relaunch. The next regular updater launch resumes the pending extension handoff even before another check is due. To retry a dismissed Chromium prompt, hold **Shift** while opening **Chromium Updater**, then type **R** and press **Enter** in the console. [Extension handoff and manual fallback](docs/extensions.md#install-a-verified-update)
 

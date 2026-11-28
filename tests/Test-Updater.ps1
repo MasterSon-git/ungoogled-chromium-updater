@@ -26,6 +26,18 @@ $script:testRoot = Join-Path $env:TEMP ('uc-updater-tests-' + [guid]::NewGuid().
 function Get-UpdaterRoot { $script:testRoot }
 $root = New-PrivateRoot
 
+function New-BackupFixture([string]$Directory) {
+    foreach ($relative in 'Application\chrome.exe','Application\158.0.8127.36\chrome.dll','User Data\Local State',
+        'User Data\Default\Preferences','User Data\Default\Network\Cookies-wal','User Data\Default\Cache\cache-entry',
+        'User Data\Profile 1\Secure Preferences','User Data\Profile 1\Local Extension Settings\fixture\000001.log') {
+        $path = Join-Path $Directory $relative
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+        [IO.File]::WriteAllText($path, 'good')
+    }
+    @{ browserPath = Join-Path $Directory 'Application\chrome.exe'; userData = Join-Path $Directory 'User Data'
+        architecture = 'x64'; browserTrust = @{ allowUnsigned = $true } }
+}
+
 try {
     Test-Case 'daily success, local day rollover, forced check and retry timing' {
         $now = [DateTimeOffset]::Parse('2026-11-27T18:00:00+01:00')
@@ -246,11 +258,15 @@ try {
             @{ Status = $record.GateStatus; Detail = 'fixture'; Files = @{ 'chrome.exe' = 'hash' } }
         }
         $previous = @{ Inventory = @{} }
-        Assert-Equal (Invoke-Workflow $root $config $previous).Status 'Action'
+        $outcome = Invoke-Workflow $root $config $previous
+        Assert-Equal $outcome.Status 'Complete'
+        Assert-Equal $outcome.Upstream.Status 'Gap'
         Assert-Equal $record.Installs 1
         Assert-Equal (@($record.Messages -like '*158.0.8127.36 trails Chrome stable 158.0.8127.89*').Count) 1
         function Get-UpstreamStable { throw 'service unavailable' }
-        Assert-Equal (Invoke-Workflow $root $config $previous).Status 'Action'
+        $outcome = Invoke-Workflow $root $config $previous
+        Assert-Equal $outcome.Status 'Complete'
+        Assert-Equal $outcome.Upstream.Status 'Unavailable'
         Assert-Equal $record.Installs 2
         Assert-Equal (@($record.Messages -like '*comparison is unavailable*').Count) 1
         foreach ($gateStatus in 'Incompatible','Inconclusive','OperationalFailure') {
@@ -278,6 +294,53 @@ try {
         function Get-BrowserArtifact { throw 'Browser installer SHA-256 or byte count mismatch.' }
         Assert-Equal (Invoke-Workflow $root $config $previous).Status 'Failed'
         Assert-Equal $record.Installs 3
+    }
+
+    Test-Case 'patch gap is visible on daily checks and does not reopen the console by itself' {
+        $isolated = Join-Path $root 'daily-advisory'
+        [void](New-PrivateRoot $isolated)
+        $configFixture = @{ browserPath = 'fixture'; userData = 'fixture'; architecture = 'x64'; browserArgs = @()
+            selfUpdateEnabled = $false; extensions = @{} }
+        $installedFixture = [version]'158.0.8127.36'
+        $record = @{ Stable = [version]'158.0.8127.89'; Checks = 0; Launches = 0; Messages = [Collections.Generic.List[string]]::new() }
+        function Read-Config { $configFixture }
+        function Get-BrowserVersion { $installedFixture }
+        function Get-ExtensionInventory { }
+        function Get-WindowsCandidate { $record.Checks++; @{ Tag = "$installedFixture-1"; Version = $installedFixture } }
+        function Invoke-BrowserUpdate { @{ Status = 'Complete'; Version = $installedFixture } }
+        function Get-UpstreamStable { $record.Stable }
+        function Set-UpdaterShortcut { }
+        function Write-Status($Level, $Message) { $record.Messages.Add("$Level $Message") }
+        function Start-Chromium { $record.Launches++ }
+        $Dispatch = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 10
+        Assert-Equal $record.Checks 0
+        $Dispatch = $false
+        $Interactive = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        $stateFile = Join-Path $isolated 'state.json'
+        $saved = Read-DailyState $stateFile
+        Assert-Equal $saved.Status 'Complete'
+        Assert-Equal $saved.Upstream.Status 'Gap'
+        Assert-Equal @($record.Messages -like 'WARN *trails Chrome stable*').Count 1
+        $saved.Attempt = [DateTimeOffset]::Now.AddHours(-3).ToString('o')
+        Write-Json $stateFile $saved
+        $Dispatch = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        Assert-Equal $record.Checks 1
+        $saved.Day = [DateTimeOffset]::Now.AddDays(-1).ToString('yyyy-MM-dd')
+        Write-Json $stateFile $saved
+        $record.Stable = [version]'158.0.8127.90'
+        Assert-Equal (Invoke-UpdateSession $isolated) 10
+        $Dispatch = $false
+        $SelfUpdateOutcome = 'Failed'
+        Assert-Equal (Invoke-UpdateSession $isolated) 2
+        $saved = Read-DailyState $stateFile
+        Assert-Equal $saved.UpdaterStatus 'Failed'
+        Assert-Equal $saved.Status 'Complete'
+        Assert-Equal $saved.Upstream.Version '158.0.8127.90'
+        Assert-Equal @($record.Messages -like 'WARN *trails Chrome stable 158.0.8127.90*').Count 1
+        Assert-Equal $record.Launches 3
     }
 
     Test-Case 'MV2 cache only accepts exact verified identities and successful runs' {
@@ -792,14 +855,19 @@ function Invoke-UpdateSession([string]$Root) {
             } } }
         }
         Write-ComponentRegistration $firstProfile $initial
-        $fixture = @{ Checks = 0; Launches = 0 }
+        $fixture = @{ Checks = 0; Launches = 0; StoreIds = 0; Messages = [Collections.Generic.List[string]]::new()
+            Logs = [Collections.Generic.List[string]]::new() }
         $fixtureConfig = @{ browserPath = 'fixture'; userData = $profileRoot; architecture = 'x64'; browserArgs = @(); extensions = @{} }
         $version = [version]'158.0.8127.36'
         function Read-Config { $fixtureConfig }
         function Get-BrowserVersion { $version }
         function Get-WindowsCandidate { @{ Tag = "$version-1"; Version = $version } }
         function Get-UpstreamStable { $version }
-        function Get-StoreUpdates { @{} }
+        function Get-StoreUpdates($Ids) { $fixture.StoreIds += @($Ids).Count; @{} }
+        function Write-Status($Level, $Message, $LogMessage = $Message) {
+            $fixture.Messages.Add("$Level $Message")
+            $fixture.Logs.Add($LogMessage)
+        }
         function Invoke-BrowserUpdate {
             $fixture.Checks++
             if ($fixture.Checks -eq 1) {
@@ -831,6 +899,18 @@ function Invoke-UpdateSession([string]$Root) {
         Assert-Equal $state.InventoryRefresh $null
         Assert-Equal $state.Inventory.Contains("Profile 1/$afterLaunch") $true
         Assert-Equal $fixture.Checks 2
+        Assert-Equal $state.Status 'Complete'
+        Assert-Equal $state.Inventory["Profile 1/$afterLaunch"].Update 'Component'
+        Assert-Equal @($fixture.Messages -like 'INFO *browser-managed component added to inventory').Count 2
+        Assert-Equal @($fixture.Logs -like "Component $afterLaunch *added to inventory").Count 1
+        Assert-Equal @($fixture.Logs -like '*Profile 1*').Count 0
+        Assert-Equal $fixture.StoreIds 0
+        $fixture.Messages.Clear()
+        [IO.File]::Delete((Join-Path $startupProfile 'Preferences'))
+        $Force = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        Assert-Equal @($fixture.Messages -like "INFO *browser-managed component $afterLaunch is no longer registered*").Count 1
+        Assert-Equal @($fixture.Messages -like "INFO *$afterInstall*added to inventory").Count 0
     }
 
     Test-Case 'CRX3 cryptography rejects a modified package, unpinned ID and absent Store proof' {
@@ -874,13 +954,120 @@ function Invoke-UpdateSession([string]$Root) {
         } finally { $rsa.Dispose() }
     }
 
-    Test-Case 'consistent backup copies files and verifies contents' {
-        $inputDir = Join-Path $root 'input'
-        $outputDir = Join-Path $root 'output'
-        [void][IO.Directory]::CreateDirectory($inputDir)
-        [IO.File]::WriteAllText((Join-Path $inputDir 'profile-fixture.txt'),'fixture')
-        Copy-BrowserTree $inputDir $outputDir
-        Assert-Equal ([IO.File]::ReadAllText((Join-Path $outputDir 'profile-fixture.txt'))) 'fixture'
+    Test-Case 'closed snapshot copies both trees and SHA-256 verifies the documented recovery scope' {
+        $isolated = Join-Path $root 'backup-scope'
+        $config = New-BackupFixture $isolated
+        $version = [version]'158.0.8127.36'
+        function Test-BrowserBusy { $false }
+        $parent = Join-Path $isolated 'backups'
+        $legacy = '20261127T110000Z-' + ('a' * 32)
+        $abandoned = '20261127T120000Z-' + ('b' * 32)
+        foreach ($dir in $legacy,$abandoned,'incomplete','operator-copy') {
+            [void][IO.Directory]::CreateDirectory((Join-Path $parent $dir))
+        }
+        Write-Json (Join-Path $parent "$legacy\complete.json") @{ Version = $version.ToString(); Created = '2026-11-27T11:00:00Z' }
+        $name = New-BrowserBackup $isolated $config $version
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $parent 'incomplete'))) $false
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $parent $abandoned))) $false
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $parent 'operator-copy'))) $true
+        Assert-Equal (Confirm-BrowserBackup $isolated $legacy) 'Legacy'
+        Assert-Equal (Confirm-BrowserBackup $isolated $name) 'Verified'
+        $backup = Join-Path $parent $name
+        $record = Read-Json (Join-Path $backup 'complete.json')
+        Assert-Equal $record.HashScope 'sha256-v1'
+        Assert-Equal $record.Hashes.Count 7
+        $cache = Join-Path $backup 'User Data\Default\Cache\cache-entry'
+        Assert-Equal ([IO.File]::ReadAllText($cache)) 'good'
+        [IO.File]::WriteAllText($cache, 'evil')
+        Assert-Equal (Confirm-BrowserBackup $isolated $name) 'Verified'
+        foreach ($relative in 'Application\158.0.8127.36\chrome.dll','User Data\Profile 1\Secure Preferences',
+            'User Data\Default\Network\Cookies-wal','User Data\Profile 1\Local Extension Settings\fixture\000001.log') {
+            $file = Join-Path $backup $relative
+            $time = [IO.File]::GetLastWriteTimeUtc($file)
+            [IO.File]::WriteAllText($file, 'evil')
+            [IO.File]::SetLastWriteTimeUtc($file, $time)
+            Assert-Fails { Confirm-BrowserBackup $isolated $name } 'SHA-256 verification found missing or changed files'
+            [IO.File]::WriteAllText($file, 'good')
+            [IO.File]::SetLastWriteTimeUtc($file, $time)
+        }
+        [IO.File]::Delete((Join-Path $backup 'User Data\Local State'))
+        Assert-Fails { Confirm-BrowserBackup $isolated $name } 'SHA-256 verification found missing or changed files'
+        Assert-Fails { Confirm-BrowserBackup $isolated '..\operator-copy' } 'completed backup by its folder name'
+    }
+
+    Test-Case 'backup verification errors block installation and preserve both completed snapshots' {
+        $isolated = Join-Path $root 'failed-backup'
+        $config = New-BackupFixture $isolated
+        $version = [version]'158.0.8127.36'
+        $candidate = @{ Version = [version]'158.0.8127.88'; Tag = '158.0.8127.88-1.1'; Digest = 'a' * 64 }
+        $artifact = @{ Path = (Join-Path $isolated 'unused-installer.exe'); Signer = $null }
+        $fixture = @{ Corrupt = 'Copy'; AfterBackup = 0 }
+        function Test-BrowserBusy { $false }
+        function Assert-RegisteredInstall { }
+        function Get-BrowserVersion { $version }
+        function Test-ArtifactFile { $fixture.AfterBackup++; $true }
+        $known = @(New-BrowserBackup $isolated $config $version; New-BrowserBackup $isolated $config $version)
+        $parent = Join-Path $isolated 'backups'
+        $verifiedCopy = (Get-Command Copy-BrowserTree).ScriptBlock
+        function Copy-BrowserTree($Source, $Destination) {
+            & $verifiedCopy $Source $Destination
+            if ([IO.Path]::GetFileName($Destination) -ceq 'User Data') {
+                $tree = if ($fixture.Corrupt -ceq 'Copy') { $Destination } else { $Source }
+                $prefs = Join-Path $tree 'Default\Preferences'
+                $modified = [IO.File]::GetLastWriteTimeUtc($prefs)
+                [IO.File]::WriteAllText($prefs, 'evil')
+                [IO.File]::SetLastWriteTimeUtc($prefs, $modified)
+                & (Join-Path ([Environment]::SystemDirectory) 'robocopy.exe') $Source $Destination /L /E /COPY:DAT /DCOPY:DAT /XJ /R:0 /W:0 /NFL /NDL /NJH /NJS /NP *> $null
+                Assert-Equal $LASTEXITCODE 0
+            }
+        }
+        foreach ($corrupt in 'Copy','Source') {
+            $fixture.Corrupt = $corrupt
+            Assert-Fails { Install-BrowserCandidate $isolated $config $version $candidate $artifact } 'SHA-256 verification found missing or changed files'
+            Assert-Equal @(Get-ChildItem -LiteralPath $parent -Directory | Where-Object { $_.Name -cnotin $known }).Count 0
+            Assert-Equal @(Get-ChildItem -LiteralPath $parent -Directory).Count 2
+        }
+        $file = Join-Path $config.userData 'Local State'
+        $lock = [IO.File]::Open($file, 'Open', 'ReadWrite', 'None')
+        try {
+            Assert-Fails { Install-BrowserCandidate $isolated $config $version $candidate $artifact } 'could not be read for SHA-256'
+        } finally { $lock.Dispose() }
+        Assert-Equal $fixture.AfterBackup 0
+        Assert-Equal ([IO.File]::Exists((Join-Path $isolated 'installation.json'))) $false
+        Assert-Equal ([IO.File]::Exists((Join-Path $isolated 'installer-preferences.json'))) $false
+        foreach ($name in $known) { Assert-Equal (Confirm-BrowserBackup $isolated $name) 'Verified' }
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $parent 'incomplete'))) $false
+    }
+
+    Test-Case 'backup retention rotates completed copies and refuses unsafe incomplete cleanup' {
+        $isolated = Join-Path $root 'backup-retention'
+        $config = New-BackupFixture $isolated
+        $version = [version]'158.0.8127.36'
+        function Test-BrowserBusy { $false }
+        $parent = Join-Path $isolated 'backups'
+        $older = '20261127T110000Z-' + ('a' * 32)
+        $previous = '20261127T120000Z-' + ('b' * 32)
+        foreach ($old in $older,$previous) {
+            $path = Join-Path $parent $old
+            [void][IO.Directory]::CreateDirectory($path)
+            Write-Json (Join-Path $path 'complete.json') @{ Version = $version.ToString(); Created = '2026-11-27T12:00:00Z' }
+        }
+        $name = New-BrowserBackup $isolated $config $version
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $parent $older))) $false
+        Assert-Equal ([IO.Directory]::Exists((Join-Path $parent $previous))) $true
+        Assert-Equal (Confirm-BrowserBackup $isolated $name) 'Verified'
+        $outside = Join-Path $isolated 'unmanaged'
+        [void][IO.Directory]::CreateDirectory($outside)
+        $witness = Join-Path $outside 'keep.txt'
+        [IO.File]::WriteAllText($witness, 'keep')
+        $link = Join-Path $parent 'incomplete'
+        New-Item -ItemType Junction -Path $link -Target $outside | Out-Null
+        try {
+            Assert-Fails { New-BrowserBackup $isolated $config $version } 'Backup cleanup failed'
+            Assert-Equal ([IO.File]::ReadAllText($witness)) 'keep'
+            Assert-Equal (Confirm-BrowserBackup $isolated $name) 'Verified'
+            Assert-Equal ([IO.Directory]::Exists((Join-Path $parent $previous))) $true
+        } finally { [IO.Directory]::Delete($link) }
     }
 
     Test-Case 'running browser defers installation and pending marker blocks retry' {
@@ -899,19 +1086,29 @@ function Invoke-UpdateSession([string]$Root) {
     }
 
     Test-Case 'interrupted installer leaves a recovery marker and never launches a browser' {
+        $isolated = Join-Path $root 'backup-recovery'
+        [void](New-PrivateRoot $isolated)
         $candidate = @{ Version = [version]'158.0.8127.36'; Tag = '158.0.8127.36-1.1'; Digest = 'a' * 64 }
-        $config = @{ browserTrust = @{ allowUnsigned = $true }; browserPath = 'fixture'; architecture = 'x64' }
+        $config = New-BackupFixture $isolated
         $artifact = @{ Signer = $null; Path = (Join-Path $root 'absent-installer.exe') }
         function Test-BrowserBusy($Config) { $false }
         function Assert-RegisteredInstall($Config, $Version) { }
         function Get-BrowserVersion { [version]'150.0.7871.186' }
-        function New-BrowserBackup($Root, $Config, $Version) { 'fixture-backup' }
         function Test-ArtifactFile($Path, $Artifact) { $true }
-        try { Install-BrowserCandidate $root $config ([version]'150.0.7871.186') $candidate $artifact | Out-Null }
+        try { Install-BrowserCandidate $isolated $config ([version]'150.0.7871.186') $candidate $artifact | Out-Null }
         catch [Management.Automation.MethodInvocationException] { }
-        $marker = Join-Path $root 'installation.json'
-        Assert-Equal (Read-Json $marker).Backup 'fixture-backup'
-        [IO.File]::Delete($marker)
+        $marker = Join-Path $isolated 'installation.json'
+        $recovery = Read-Json $marker
+        Assert-Equal (Confirm-BrowserBackup $isolated $recovery.Backup) 'Verified'
+        Assert-Fails { Remove-ExpiredBackups $isolated } 'interrupted installation requires recovery'
+        $VerifyBackup = $recovery.Backup
+        $workerFixture = Join-Path $PSScriptRoot '../src'
+        function Get-UpdaterRoot { $isolated }
+        function Get-UpdaterSlot { @{ Directory = $workerFixture } }
+        Assert-Equal (Invoke-Launcher) 0
+        [IO.File]::WriteAllText((Join-Path $isolated "backups\$VerifyBackup\User Data\Local State"), 'evil')
+        Assert-Equal (Invoke-Launcher) 1
+        Assert-Equal (Read-Json $marker).Backup $VerifyBackup
     }
 
     Test-Case 'same-version install records a verified revision or blocks launch after a payload mismatch' {
@@ -950,7 +1147,6 @@ public static class InstallerFixture {
         function Test-BrowserBusy { $busy.Checks++; $busy.Checks -eq $busy.At }
         function Assert-RegisteredInstall { }
         function New-BrowserBackup { 'fixture-backup' }
-        function Remove-ExpiredBackups { }
         function Test-ArtifactFile { $true }
         $files = @{ "$version\chrome.dll" = [Convert]::ToHexString(
             [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes('after'))) }

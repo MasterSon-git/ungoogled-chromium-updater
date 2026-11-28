@@ -4,6 +4,7 @@ param(
     [switch]$Force, [switch]$CheckOnly, [switch]$Stage, [switch]$Apply, [switch]$NoLaunch,
     [switch]$RetryExtensionUpdates, [switch]$ExtensionActions,
     [switch]$VerifyCurrent, [switch]$TestCompatibility, [switch]$Dispatch, [switch]$Interactive, [switch]$Probe,
+    [string]$VerifyBackup,
     [ValidateSet('Applied','Failed')][string]$SelfUpdateOutcome,
     [string]$Payload,
     [string[]]$BrowserArguments = @()
@@ -38,7 +39,7 @@ function Invoke-Launcher {
         [IO.Path]::GetDirectoryName($PSScriptRoot)
     } else { Get-UpdaterRoot }
     Assert-PrivateRoot $root
-    if ($ExtensionActions -and $Interactive -and !$Dispatch -and !$RetryExtensionUpdates -and
+    if ($ExtensionActions -and $Interactive -and !$Dispatch -and !$RetryExtensionUpdates -and !$VerifyBackup -and
         !$CheckOnly -and !$Stage -and !$NoLaunch -and ![IO.File]::Exists((Join-Path $root 'installation.json'))) {
         $RetryExtensionUpdates = Read-ExtensionRetryChoice (Read-DailyState (Join-Path $root 'state.json'))
     }
@@ -59,6 +60,19 @@ function Invoke-Launcher {
         if (!(Test-Path -LiteralPath $worker -PathType Leaf)) { throw 'The active updater is missing. Run Setup.ps1 -Install to recover.' }
         return & {
             . $worker
+            if ($VerifyBackup) {
+                try {
+                    if ((Confirm-BrowserBackup $root $VerifyBackup) -ceq 'Legacy') {
+                        Write-Status WARN 'This backup predates SHA-256 verification. See the legacy backup recovery instructions.'
+                        return 2
+                    }
+                    Write-Status ' OK ' 'Backup SHA-256 checks passed for the documented recovery scope.'
+                    return 0
+                } catch {
+                    Write-Status ERROR (Get-SafeProblem $_ 'The backup could not be verified.')
+                    return 1
+                }
+            }
             Invoke-UpdateSession $root
         }
     } finally { $lock.Dispose() }
