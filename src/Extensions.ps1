@@ -318,6 +318,6 @@ function Test-ExtensionCandidate($Extension, [string]$Channel, $Asset, [version]
         $outcome.Update = 'Pending'
         $outcome.Text += if ($Extension.Enabled) { ' Pending installation in Chromium.' }
             else { ' Pending installation in Chromium. Keep the extension disabled.' }
-    } else { $outcome.Text += ' Run Update.ps1 -Stage to save the verified CRX.' }
+    } else { $outcome.Text += ' Run a normal launcher check for Chromium handoff, or Update.ps1 -Stage to save the verified CRX.' }
     $outcome
 }
