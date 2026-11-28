@@ -36,15 +36,18 @@ function Publish-FixtureFeed([string]$Package, $Release) {
     Write-Json (Join-Path $feed 'releases.json') @($Release)
 }
 
-function Start-FixtureLauncher([string]$ExpectedUpdaterStatus = 'Current') {
+function Start-FixtureLauncher([string]$ExpectedUpdaterStatus = 'Current', $Shortcut) {
     $workerPidFile = Join-Path $feed 'worker.pid'
     [IO.File]::Delete($state)
     [IO.File]::Delete($argumentsFile)
     [IO.File]::Delete($requestLog)
     [IO.File]::Delete($workerPidFile)
-    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $root 'app/ChromiumUpdater.exe'))
+    $target = if ($Shortcut) { $Shortcut.TargetPath } else { Join-Path $root 'app/ChromiumUpdater.exe' }
+    $directory = if ($Shortcut) { $Shortcut.WorkingDirectory } else { $feed }
+    $start = [Diagnostics.ProcessStartInfo]::new($target)
     $start.UseShellExecute = $false
-    $start.WorkingDirectory = $feed
+    $start.CreateNoWindow = $true
+    $start.WorkingDirectory = $directory
     foreach ($arg in $arguments) { [void]$start.ArgumentList.Add($arg) }
     $front = [Diagnostics.Process]::Start($start)
     try {
@@ -58,11 +61,9 @@ function Start-FixtureLauncher([string]$ExpectedUpdaterStatus = 'Current') {
             throw 'Fixture browser was not launched.'
         }
         $received = Read-Json $argumentsFile
-        Assert-Equal $received.directory $feed
+        Assert-Equal $received.directory $directory
         Assert-Equal $received.arguments.Count $arguments.Count
         for ($i = 0; $i -lt $arguments.Count; $i++) { Assert-Equal $received.arguments[$i] $arguments[$i] }
-        Assert-Equal (Read-DailyState $state).Status 'Complete'
-        Assert-Equal (Read-DailyState $state).UpdaterStatus $ExpectedUpdaterStatus
         $workerProcess = try { [Diagnostics.Process]::GetProcessById([int][IO.File]::ReadAllText($workerPidFile)) }
         catch [ArgumentException] { $null }
         if ($workerProcess) {
@@ -70,6 +71,8 @@ function Start-FixtureLauncher([string]$ExpectedUpdaterStatus = 'Current') {
                 if (!$workerProcess.WaitForExit(10000)) { throw 'Fixture worker did not exit.' }
             } finally { $workerProcess.Dispose() }
         }
+        Assert-Equal (Read-DailyState $state).Status 'Complete'
+        Assert-Equal (Read-DailyState $state).UpdaterStatus $ExpectedUpdaterStatus
     } finally { $front.Dispose() }
 }
 
@@ -191,11 +194,19 @@ function Invoke-TrustedGet {
     $bootstrap = [IO.File]::ReadAllText($bootstrapFile).Replace("[void](Read-Host 'Press Enter to close this window')", 'Start-Sleep -Milliseconds 1500')
     [IO.File]::WriteAllText($bootstrapFile, $bootstrap)
     $launcherFile = Join-Path $src 'Launcher.cs'
-    $launcher = [IO.File]::ReadAllText($launcherFile)
+    $launcher = [IO.File]::ReadAllText($launcherFile).Replace('visible.UseShellExecute = true;', @'
+visible.UseShellExecute = false;
+            visible.CreateNoWindow = true;
+'@).Replace('command + " -Interactive"', '"-NonInteractive " + command + " -Interactive"') -replace '(?s)MessageBox.Show\(.*?MessageBoxIcon.Error\);', 'Environment.ExitCode = 1;'
+    [IO.File]::WriteAllText($launcherFile, $launcher)
     $setupFile = Join-Path $src 'Setup.ps1'
     $setup = [IO.File]::ReadAllText($setupFile)
     $selfUpdateFile = Join-Path $src 'SelfUpdate.ps1'
-    $selfUpdate = [IO.File]::ReadAllText($selfUpdateFile)
+    $selfUpdate = [IO.File]::ReadAllText($selfUpdateFile).Replace('        $start.WorkingDirectory = $Root', @'
+        $start.CreateNoWindow = $true
+        $start.WorkingDirectory = $Root
+'@)
+    [IO.File]::WriteAllText($selfUpdateFile, $selfUpdate)
     $workerFile = Join-Path $src 'Worker.ps1'
     $worker = [IO.File]::ReadAllText($workerFile).Replace(
         '    $installed = Get-BrowserVersion', @'
@@ -226,15 +237,12 @@ try { $code = Invoke-Launcher }
             [IO.File]::WriteAllText((Join-Path $src 'Maintenance.txt'), 'upgraded maintenance')
             $files['Maintenance.txt'] = 'src/Maintenance.txt'
             [IO.File]::WriteAllText($selfUpdateFile, $selfUpdate.Replace(
-                'function Get-UpdaterPackageFiles { Get-UpdaterCoreFiles }', @'
-function Get-UpdaterPackageFiles {
-    $files = Get-UpdaterCoreFiles
+                "    `$files['UpdaterShortcut.ps1'] = 'src/UpdaterShortcut.ps1'", @'
+    $files['UpdaterShortcut.ps1'] = 'src/UpdaterShortcut.ps1'
     $files['Maintenance.txt'] = 'src/Maintenance.txt'
-    $files
-}
 '@))
             [IO.File]::WriteAllText($setupFile, $setup.Replace('        if ($TestInstall -eq [guid]::Empty) { Set-LauncherShortcuts $root $true }', @'
-        [IO.File]::Copy((Join-Path $PSScriptRoot 'Maintenance.txt'), (Join-Path $root 'maintenance-result.txt'))
+        [IO.File]::Copy((Join-Path $PSScriptRoot 'Maintenance.txt'), (Join-Path $root 'maintenance-result.txt'), $true)
         if ($TestInstall -eq [guid]::Empty) { Set-LauncherShortcuts $root $true }
 '@))
         }
@@ -312,12 +320,18 @@ function Get-UpdaterPackageFiles {
     [IO.File]::WriteAllText($versionFile, $base.Text)
     [IO.File]::WriteAllText($workerFile, $worker)
     [IO.File]::WriteAllText($handoffFile, $handoff)
-    [IO.File]::WriteAllText($launcherFile, $launcher)
+    [IO.File]::WriteAllText($launcherFile, $launcher.Replace('            LauncherIdentity.InitializeProcess();', ''))
     [IO.File]::WriteAllText($bootstrapFile, $bootstrap)
-    [IO.File]::WriteAllText($setupFile, $setup)
-    [IO.File]::WriteAllText($selfUpdateFile, $selfUpdate)
+    # Model the RC2 package reader and installed app, which have no dedicated integration files.
+    [IO.File]::WriteAllText($setupFile, ($setup -replace '(?m)^.*UpdaterShortcut.*\r?\n', ''))
+    [IO.File]::WriteAllText($workerFile, ($worker.Replace(". (Join-Path `$PSScriptRoot 'UpdaterShortcut.ps1')", '') -replace
+        '(?m)^    if \(\$SelfUpdateOutcome -ceq ''Applied'' -or \(\$Interactive[\s\S]*?^    }\r?\n', ''))
+    [IO.File]::WriteAllText($selfUpdateFile, ($selfUpdate -replace '(?m)^.*\[''UpdaterShortcut.ps1''\] = .*\r?\n', ''))
     & (Join-Path $src 'Setup.ps1') -Install -TestInstall $id
     Assert-PrivateRoot $root
+    $shortcutPath = Join-Path $root 'test-programs/Chromium Updater.lnk'
+    Assert-Equal ([IO.File]::Exists($shortcutPath)) $false
+    Assert-Equal ([IO.File]::Exists((Join-Path $root 'app/UpdaterShortcut.ps1'))) $false
     $feed = Join-Path $root 'fixture-feed'
     $state = Join-Path $root 'state.json'
     $configPath = Join-Path $root 'config.json'
@@ -388,6 +402,15 @@ internal static class Recorder {
     $configBefore = (Get-FileHash -LiteralPath $configPath).Hash
     Start-FixtureLauncher 'Applied'
     Assert-Equal (Read-Json $activePath).Version '0.2.0-rc.2'
+    $shell = New-Object -ComObject WScript.Shell
+    $shortcut = $shell.CreateShortcut($shortcutPath)
+    Assert-Equal $shortcut.TargetPath (Join-Path $root 'app/ChromiumUpdater.exe')
+    Assert-Equal $shortcut.IconLocation "$($config.browserPath),0"
+    Assert-Equal $shortcut.Arguments ''
+    $programs = (New-Object -ComObject Shell.Application).NameSpace([IO.Path]::GetDirectoryName($shortcutPath))
+    $item = $programs.ParseName([IO.Path]::GetFileName($shortcutPath))
+    Assert-Equal ($item.ExtendedProperty('System.AppUserModel.ID')) 'MasterSon.UngoogledChromiumUpdater'
+    $shortcutHash = (Get-FileHash -LiteralPath $shortcutPath).Hash
     Assert-Equal (Get-FileHash -LiteralPath $configPath).Hash $configBefore
     Assert-Equal ([IO.File]::ReadAllLines($requestLog).Count) 1
     $logs = Get-Content (Join-Path $root 'logs/*.log') -Raw
@@ -409,6 +432,7 @@ internal static class Recorder {
     $launcherHash = (Get-FileHash -LiteralPath $launcherTarget).Hash
     Start-FixtureLauncher 'Applied'
     Assert-Equal (Read-Json $activePath).Version '0.2.0'
+    Assert-Equal (Get-FileHash -LiteralPath $shortcutPath).Hash $shortcutHash
     Assert-Equal (Get-Content -LiteralPath (Join-Path $feed 'new-bootstrap.txt') -Raw) 'new bootstrap'
     Assert-Equal (Get-Content -LiteralPath (Join-Path $root 'app/Maintenance.txt') -Raw) 'upgraded maintenance'
     Assert-Equal (Get-FileHash -LiteralPath (Join-Path $root 'updater-previous-app/ChromiumUpdater.exe')).Hash $launcherHash
@@ -451,13 +475,14 @@ internal static class Recorder {
     Test-UpdaterReleasePackage $zip '0.2.0' $recovery
     [IO.File]::WriteAllText($activePath, 'interrupted')
     & (Join-Path $recovery 'Setup.ps1') -Install -TestInstall $id
+    Assert-Equal (Get-FileHash -LiteralPath $shortcutPath).Hash $shortcutHash
     Assert-Equal (Get-UpdaterSlot $root).Slot 'app'
     Assert-Equal (Get-UpdaterVersion (Join-Path $root 'app/Updater.version')).Text '0.2.0'
     Assert-Equal (Get-FileHash -LiteralPath $configPath).Hash $configBefore
     Assert-Equal (Read-Json $marker).Interrupted $true
     [IO.File]::Delete($marker)
     Publish-FixtureFeed $zip $stable
-    Start-FixtureLauncher
+    Start-FixtureLauncher -Shortcut $shortcut
     Assert-Equal (Get-UpdaterSlot $root).Slot 'app'
 
     # A hard exit here leaves the fixed shortcut target missing and the full prior app retained.
@@ -496,9 +521,33 @@ internal static class Recorder {
     Start-FixtureLauncher 'Unavailable'
     Assert-Equal ([IO.File]::Exists($requestLog)) $false
     & (Join-Path $root 'app/Setup.ps1') -Uninstall -TestInstall $id
+    Assert-Equal ([IO.File]::Exists($shortcutPath)) $false
     Assert-Equal (Get-Content -LiteralPath (Join-Path $root 'maintenance-result.txt') -Raw) 'upgraded maintenance'
     Assert-Equal ([IO.Directory]::Exists((Join-Path $root 'app'))) $false
     Write-Output 'PASS failed network, interrupted staging, failed worker probe, concurrent dispatch, browser recovery and verified manual reinstall'
+
+    $shortcut.TargetPath = $config.browserPath
+    $shortcut.Save()
+    $unownedHash = (Get-FileHash -LiteralPath $shortcutPath).Hash
+    & (Join-Path $recovery 'Setup.ps1') -Install -TestInstall $id
+    Assert-Equal (Get-FileHash -LiteralPath $shortcutPath).Hash $unownedHash
+    & (Join-Path $recovery 'Setup.ps1') -Uninstall -TestInstall $id
+    Assert-Equal (Get-FileHash -LiteralPath $shortcutPath).Hash $unownedHash
+    [IO.File]::Delete($shortcutPath)
+    & (Join-Path $recovery 'Setup.ps1') -Install -TestInstall $id
+    $config.browserPath = Join-Path $root 'other-browser/chrome.exe'
+    Write-Json $configPath $config
+    & (Join-Path $recovery 'Setup.ps1') -Install -TestInstall $id
+    $edited = $shell.CreateShortcut($shortcutPath)
+    Assert-Equal $edited.IconLocation "$($config.browserPath),0"
+    $edited.Arguments = '--user-edited'
+    $edited.Save()
+    $editedHash = (Get-FileHash -LiteralPath $shortcutPath).Hash
+    & (Join-Path $recovery 'Setup.ps1') -Install -TestInstall $id
+    Assert-Equal (Get-FileHash -LiteralPath $shortcutPath).Hash $editedHash
+    & (Join-Path $recovery 'Setup.ps1') -Uninstall -TestInstall $id
+    Assert-Equal (Get-FileHash -LiteralPath $shortcutPath).Hash $editedHash
+    Write-Output 'PASS dedicated shortcut self-update migration, identity, icon, idempotency, ownership, uninstall and launch arguments'
 } finally {
     $signer.Dispose()
     Remove-TestDirectory $root ("$(Get-UpdaterRoot)-Test-$($id.ToString('N'))")

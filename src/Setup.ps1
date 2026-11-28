@@ -11,6 +11,7 @@ param(
 . (Join-Path $PSScriptRoot 'Browser.ps1')
 . (Join-Path $PSScriptRoot 'BrowserPayload.ps1')
 . (Join-Path $PSScriptRoot 'SelfUpdate.ps1')
+. (Join-Path $PSScriptRoot 'UpdaterShortcut.ps1')
 
 function Write-Status([string]$Level, [string]$Message) {
     Write-Host "[$Level] $Message"
@@ -183,12 +184,19 @@ $guard = Enter-UpdateLock $root 20
 if (!$guard) { throw 'A launcher operation is in progress. Retry after it finishes.' }
 try {
     if (Test-PendingUpdaterHandoff $root) { throw 'An updater activation is pending. Retry after it finishes.' }
-    if ($Integrate) { Set-LauncherShortcuts $root $false }
+    if ($Integrate) {
+        Set-UpdaterShortcut $root
+        Set-LauncherShortcuts $root $false
+    }
     elseif ($Uninstall) {
         if ($TestInstall -eq [guid]::Empty) { Set-LauncherShortcuts $root $true }
+        Set-UpdaterShortcut $root -Remove
         $app = Join-Path $root 'app'
         if (Test-Path -LiteralPath $app) { Remove-LauncherDirectory $root $app }
         foreach ($name in 'updater-work','updater-a','updater-b','updater-previous-app') { Remove-UpdaterDirectory $root $name }
         Write-Host '[ OK ] Launcher removed. Private configuration, logs and backups remain available for recovery.'
-    } else { Install-LauncherFiles $root }
+    } else {
+        Install-LauncherFiles $root
+        Set-UpdaterShortcut $root
+    }
 } finally { $guard.Dispose() }
