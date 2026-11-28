@@ -178,6 +178,16 @@ function Test-Due($State, [DateTimeOffset]$Now, [bool]$Force) {
     $Now -lt $attempt -or $Now -ge $attempt.AddMinutes($minutes)
 }
 
+function Test-RequestedExtensionUpdates($Inventory) {
+    foreach ($record in $Inventory.Values) {
+        if ($record -is [Collections.IDictionary] -and $record['Update'] -ceq 'Pending' -and
+            $record['HandoffDigest'] -cmatch '^[a-fA-F0-9]{64}$' -and
+            (!$record['OfferedDigest'] -or $record['OfferedDigest'] -ieq $record['HandoffDigest']) -and
+            $record['AwaitingPromptDigest'] -ine $record['HandoffDigest']) { return $true }
+    }
+    $false
+}
+
 function Get-Version([string]$Value) {
     if ($Value -cnotmatch '^\d{1,6}(\.\d{1,6}){0,3}$') { throw 'Invalid version syntax.' }
     $parts = @($Value.Split('.') | ForEach-Object { [int]$_ })

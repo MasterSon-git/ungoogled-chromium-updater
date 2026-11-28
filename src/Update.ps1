@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [switch]$Force, [switch]$CheckOnly, [switch]$Stage, [switch]$Apply, [switch]$NoLaunch,
-    [switch]$RetryExtensionUpdates,
+    [switch]$RetryExtensionUpdates, [switch]$ExtensionActions,
     [switch]$VerifyCurrent, [switch]$TestCompatibility, [switch]$Dispatch, [switch]$Interactive, [switch]$Probe,
     [ValidateSet('Applied','Failed')][string]$SelfUpdateOutcome,
     [string]$Payload,
@@ -10,6 +10,14 @@ param(
 )
 
 . (Join-Path $PSScriptRoot 'Common.ps1')
+
+function Read-ExtensionRetryChoice($State) {
+    if (!(Test-RequestedExtensionUpdates $State.Inventory)) {
+        Write-Host '[INFO] There are no previously requested extension installs to retry.'
+        return $false
+    }
+    ([string](Read-Host 'Type R and press Enter to retry previous extension prompts, or press Enter to continue')).Trim() -ieq 'r'
+}
 
 function Invoke-Launcher {
     if ($Payload) {
@@ -30,6 +38,10 @@ function Invoke-Launcher {
         [IO.Path]::GetDirectoryName($PSScriptRoot)
     } else { Get-UpdaterRoot }
     Assert-PrivateRoot $root
+    if ($ExtensionActions -and $Interactive -and !$Dispatch -and !$RetryExtensionUpdates -and
+        !$CheckOnly -and !$Stage -and !$NoLaunch -and ![IO.File]::Exists((Join-Path $root 'installation.json'))) {
+        $RetryExtensionUpdates = Read-ExtensionRetryChoice (Read-DailyState (Join-Path $root 'state.json'))
+    }
     $lock = Enter-UpdateLock $root
     if (!$lock) {
         if ($Dispatch) { return 10 }

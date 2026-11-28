@@ -4,6 +4,7 @@
 - Verify current upstream behavior against authoritative sources and, where necessary, the released Windows binaries.
 - Preserve user data, browser and extension identity, disabled states, and native integrity and permission checks. Never weaken security requirements for convenience.
 - Keep changes focused. Prefer supported mechanisms and avoid unnecessary dependencies.
+- All routine end-user operations must be accessible without command-line knowledge. PowerShell commands should be reserved for advanced configuration, diagnostics, and maintenance.
 - Run the automated checks and static validation relevant to the change. Perform focused isolated runtime validation when needed.
 - Run local tests with hidden windows, captured output, and no interactive prompts. Ask before launching a test that requires a visible window.
 - Before every game-engine test launch, verify silence through a supported option or an isolated profile with master volume and every audio category set to zero. Skip the test and report the gap if silence cannot be established.

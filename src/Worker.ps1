@@ -175,6 +175,10 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
         $observed[$key] = $record
         $canHandOff = $outcome.Update -ceq 'Pending' -and $channel -cin 'Store','Ubo','WebStoreHelper'
         if ($canHandOff) {
+            $record.OfferedDigest = $asset.Digest
+            if ($old -and $old['AwaitingPromptDigest'] -ieq $asset.Digest) {
+                $record.AwaitingPromptDigest = $asset.Digest
+            }
             $candidates.Add(@{ Key = $key; Profile = $extension.Profile; Version = $record.Version
                 Channel = $channel; Path = $outcome.Path; Asset = $asset })
         } elseif ($outcome.Status -ne 'Complete') {
@@ -202,22 +206,35 @@ function Invoke-ExtensionChecks($Inventory, $Config, [version]$Installed, $Previ
     @{ Status = Get-CheckStatus $statuses.ToArray(); Inventory = $observed; Candidates = $candidates.ToArray(); NeedsReview = $needsReview }
 }
 
+function Test-AwaitingExtensionHandoff($Config, [string[]]$Arguments, $Inventory) {
+    if (!@($Inventory.Values | Where-Object { $_ -is [Collections.IDictionary] -and $_['AwaitingPromptDigest'] }).Count) {
+        return $false
+    }
+    try {
+        $scope = Get-ChromiumHandoffScope $Config $Arguments
+        if (!$scope) { return $false }
+        $owner = Find-ReadyChromium $Config 0
+        $switches = if ($owner) { Get-RunningChromiumSwitches $Config $owner } else { $scope.Switches }
+        $null -ne $switches -and (Test-RegularChromiumLaunch $switches) -and (Test-ChromiumExtensionPrompt $scope.Data $switches)
+    } catch { $false }
+}
+
 function Invoke-ExtensionHandoffs($Config, [string[]]$Arguments, $Candidates, $State, [string]$StatePath, [bool]$Retry) {
-    $pending = @($Candidates | Where-Object { $Retry -or $State.Inventory[$_.Key]['HandoffDigest'] -ine $_.Asset.Digest })
+    $pending = @(foreach ($candidate in $Candidates) {
+        $record = $State.Inventory[$candidate.Key]
+        if ($Retry -or $record['HandoffDigest'] -ine $candidate.Asset.Digest -or
+            $record['AwaitingPromptDigest'] -ieq $candidate.Asset.Digest) { $candidate }
+    })
     if ($pending.Count -lt $Candidates.Count) {
-        Write-Status INFO 'Previously requested extension updates are still pending. Run Update.ps1 -RetryExtensionUpdates to request their prompts again.'
+        Write-Status INFO 'Previously requested extensions are still pending. To retry a dismissed prompt, hold Shift while opening Chromium Updater.'
     }
     if (!$pending.Count) { return $true }
-    $launchSwitches = Get-ChromiumSwitches (@($Config.browserArgs) + $Arguments)
-    $data = [IO.Path]::TrimEndingDirectorySeparator($Config.userData)
-    $requestedData = if ($launchSwitches.ContainsKey('user-data-dir')) { $launchSwitches['user-data-dir'] }
-        else { Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'Chromium\User Data' }
-    if (!(Test-RegularChromiumLaunch $launchSwitches) -or !$requestedData -or
-        ![IO.Path]::IsPathFullyQualified($requestedData) -or
-        [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($requestedData)) -ine $data) {
+    $scope = Get-ChromiumHandoffScope $Config $Arguments
+    if (!$scope) {
         Write-Status WARN 'Automatic CRX handoff requires a regular Chromium launch for the configured user-data directory. Use the staged CRX in the listed profile.'
         return $false
     }
+    $data = $scope.Data
     $owner = Find-ReadyChromium $Config
     if (!$owner) {
         Write-Status WARN 'The configured Chromium instance was not ready for CRX handoff. Use the staged CRX in the listed profile.'
@@ -228,10 +245,32 @@ function Invoke-ExtensionHandoffs($Config, [string[]]$Arguments, $Candidates, $S
         Write-Status WARN 'Chromium launch settings could not be confirmed. Use the staged CRX in the listed profile.'
         return $false
     }
-    if (!(Test-RegularChromiumLaunch $activeSwitches) -or !(Test-ChromiumExtensionPrompt $data $activeSwitches)) {
-        Write-Status WARN 'For automatic CRX handoff, set chrome://flags/#extension-mime-request-handling to Always prompt for install, relaunch Chromium, and run Update.ps1 -Force. Remove any conflicting launch switches. Signed drag-and-drop is a manual fallback.'
+    if (!(Test-RegularChromiumLaunch $activeSwitches)) {
+        Write-Status WARN 'The running Chromium instance is using a launch mode that prevents automatic CRX handoff. Use the staged CRX in the listed profile.'
         return $false
     }
+    if (!(Test-ChromiumExtensionPrompt $data $activeSwitches)) {
+        $changed = $false
+        foreach ($candidate in $pending) {
+            $record = $State.Inventory[$candidate.Key]
+            if ($record['AwaitingPromptDigest'] -ine $candidate.Asset.Digest) {
+                $record.AwaitingPromptDigest = $candidate.Asset.Digest
+                $changed = $true
+            }
+        }
+        if ($changed) { Write-Json $StatePath $State }
+        Write-Status WARN 'In Chromium, open chrome://flags/#extension-mime-request-handling, choose Always prompt for install, and relaunch Chromium. The updater will retry on your next regular launch.'
+        return !$changed
+    }
+    $wasWaiting = $false
+    foreach ($candidate in $pending) {
+        $record = $State.Inventory[$candidate.Key]
+        if ($record.Contains('AwaitingPromptDigest')) {
+            [void]$record.Remove('AwaitingPromptDigest')
+            $wasWaiting = $true
+        }
+    }
+    if ($wasWaiting) { Write-Json $StatePath $State }
     $current = @{}
     foreach ($extension in (Get-ExtensionInventory $data)) { $current["$($extension.Profile)/$($extension.Id)"] = $extension }
     $handled = 0
@@ -257,9 +296,25 @@ function Invoke-ExtensionHandoffs($Config, [string[]]$Arguments, $Candidates, $S
         if (!$batch.Count) { continue }
         if ((Find-ReadyChromium $Config 0) -ne $owner) { break }
         # Persist the exact requests before opening dialogs so an interrupted launcher does not repeat them.
-        foreach ($candidate in $batch) { $State.Inventory[$candidate.Key].HandoffDigest = $candidate.Asset.Digest }
+        $previousDigests = @{}
+        foreach ($candidate in $batch) {
+            $record = $State.Inventory[$candidate.Key]
+            $previousDigests[$candidate.Key] = $record['HandoffDigest']
+            $record.HandoffDigest = $candidate.Asset.Digest
+        }
         Write-Json $StatePath $State
-        Start-Chromium $handoffConfig ($target + @($batch | ForEach-Object { $_.Path }))
+        try {
+            Start-Chromium $handoffConfig ($target + @($batch | ForEach-Object { $_.Path }))
+        } catch {
+            foreach ($candidate in $batch) {
+                $record = $State.Inventory[$candidate.Key]
+                if ($previousDigests[$candidate.Key]) { $record.HandoffDigest = $previousDigests[$candidate.Key] }
+                else { [void]$record.Remove('HandoffDigest') }
+            }
+            Write-Json $StatePath $State
+            Write-Status WARN 'Chromium could not be started for a CRX handoff. Use the staged CRX in the listed profile.'
+            continue
+        }
         $handled += $batch.Count
         Write-Status INFO "Requested Chromium installation for $($batch.Count) verified CRX package(s). Review Chromium's prompts. Installation is still pending."
     }
@@ -459,6 +514,9 @@ function Invoke-UpdateSession([string]$Root) {
         $state['InventoryRefresh'] -ceq 'Pending'
     $due = Test-Due $state ([DateTimeOffset]::Now) $forceCheck
     $recover = Test-Path -LiteralPath $pending
+    if (!$due -and !$recover -and !$NoLaunch -and (Test-AwaitingExtensionHandoff $config $BrowserArguments $state.Inventory)) {
+        $due = $true
+    }
     if ($Dispatch -and ($due -or $recover)) { return 10 }
     if ($SelfUpdateOutcome -ceq 'Applied' -or ($Interactive -and $due -and !$CheckOnly -and !$Stage -and
         ![IO.File]::Exists((Join-Path $root 'updater-shortcut.json')))) {
@@ -525,20 +583,20 @@ function Invoke-UpdateSession([string]$Root) {
         Deferred { Write-Status WARN 'Update check completed with deferred work.' }
         Failed { Write-Status ERROR 'Update check did not complete successfully.' }
     }
-    $promptsHandled = $false
+    $canCloseConsole = $false
     if ($launch) {
         Start-Chromium $config $BrowserArguments
         if ($outcome['Candidates']) {
             try {
-                $promptsHandled = Invoke-ExtensionHandoffs $config $BrowserArguments $outcome.Candidates $nextState $statePath $RetryExtensionUpdates
+                $canCloseConsole = Invoke-ExtensionHandoffs $config $BrowserArguments $outcome.Candidates $nextState $statePath $RetryExtensionUpdates
             } catch {
-                Write-Status WARN 'Automatic CRX handoff could not finish. Use the listed staged files or run Update.ps1 -RetryExtensionUpdates to try again.'
+                Write-Status WARN 'Automatic CRX handoff could not finish. Use the listed staged files in Chromium.'
             }
         }
     }
     if ($outcome.Status -eq 'Failed') { return 1 }
     if ($outcome.Status -eq 'Complete' -and $updaterStatus -cnotin 'Failed','Deferred','Unavailable') { return 0 }
-    if ($Interactive -and $promptsHandled -and $outcome['NativeActionOnly'] -and
+    if ($Interactive -and $canCloseConsole -and $outcome['NativeActionOnly'] -and
         $updaterStatus -cnotin 'Failed','Deferred','Unavailable') { return 21 }
     2
 }

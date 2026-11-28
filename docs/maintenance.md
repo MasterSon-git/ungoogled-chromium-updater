@@ -66,7 +66,7 @@ All paths below are under `%LOCALAPPDATA%\UngoogledChromiumUpdater`.
 | `updater-previous-app` | Previous launcher and entry scripts retained after a swap |
 | `config.json` | Private browser and extension source configuration |
 | `config.legacy.json` | Original private configuration retained during migration |
-| `state.json` | Daily check status, separate updater outcome, per-profile extension observations, permission baselines and CRX handoff attempts, and pending startup reconciliation |
+| `state.json` | Daily check status, separate updater outcome, per-profile extension observations and permission baselines, CRX requests waiting for Chromium configuration or already submitted, and pending startup reconciliation |
 | `browser-release.json` | Last verified Windows release tag, installer digest, architecture, installed application fingerprint and applicable full uBlock Origin test evidence |
 | `mv2-pass.json` | Latest successful compatibility result and associated artifact identities and file hashes |
 | `mv2-work` | Single temporary extraction and profile directory, retained if cleanup needs attention |
