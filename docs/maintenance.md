@@ -14,6 +14,12 @@ A hard interruption between the two app directory renames can leave `app` missin
 
 A pending `installation.json` still requires the browser recovery procedure below after an updater reinstall. Leave private configuration, backups and recovery records in place. To pause updater downloads while investigating a release, set `"selfUpdateEnabled": false` in `config.json` while the updater is idle.
 
+## Start menu shortcut and taskbar pin
+
+Setup and a successful self-update create **Chromium Updater** in the per-user Start menu. The shortcut targets the stable `app\ChromiumUpdater.exe` and uses the same AppUserModelID as the launcher. Its icon location refers to index 0 in the locally configured `chrome.exe`. Chromium retains its own identity when it opens, so its windows can appear under the native Chromium pin. Windows handles pinning and unpinning through the user's taskbar actions. [Windows application identity](https://learn.microsoft.com/en-us/windows/win32/shell/appids)
+
+Rerun `app\Setup.ps1 -Integrate` to retry shortcut creation or refresh the icon reference after changing `browserPath`. A repeated setup keeps an up-to-date entry as it is. If the Start menu location moved or a same-named shortcut is unowned or edited, review the entry before retrying. Unpin **Chromium Updater** manually when uninstalling. Setup removes its unchanged dedicated entry and separately restores the backed-up Chromium shortcuts. A `-TestInstall` fixture stores its dedicated shortcut under `test-programs` in the isolated runtime instead of the Windows Start menu.
+
 ## Browser update policy
 
 In `config.json`, `browserUpdateMode` is `Automatic` for new installations. A due launcher check can apply an eligible stable release while Chromium is closed. For Manual mode, set the value to `Manual`, run `Update.ps1 -Stage`, and review the release and Authenticode status. Put the exact `tag` and `sha256` printed by staging in `browserApproval`, then use `Update.ps1 -Apply -NoLaunch` while Chromium is closed. Both modes enforce the same artifact and compatibility checks.
@@ -67,6 +73,7 @@ All paths below are under `%LOCALAPPDATA%\UngoogledChromiumUpdater`.
 | `backups` | Two verified browser and profile copies after successful installation |
 | `installation.json` | Recovery marker written immediately before starting the installer |
 | `shortcut-backups` | Original Desktop and Start Menu shortcuts |
+| `updater-shortcut.json` | Dedicated shortcut path, icon source and ownership hashes |
 
 ## Recover an interrupted installation
 

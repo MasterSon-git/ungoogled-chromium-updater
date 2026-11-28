@@ -6,6 +6,7 @@ param([switch]$Probe)
 . (Join-Path $PSScriptRoot 'BrowserPayload.ps1')
 . (Join-Path $PSScriptRoot 'Mv2.ps1')
 . (Join-Path $PSScriptRoot 'SelfUpdate.ps1')
+. (Join-Path $PSScriptRoot 'UpdaterShortcut.ps1')
 
 $script:log = $null
 function Write-Status([string]$Level, [string]$Message, [string]$LogMessage = $Message) {
@@ -281,6 +282,10 @@ function Invoke-UpdateSession([string]$Root) {
     $due = Test-Due $state ([DateTimeOffset]::Now) $forceCheck
     $recover = Test-Path -LiteralPath $pending
     if ($Dispatch -and ($due -or $recover)) { return 10 }
+    if ($SelfUpdateOutcome -ceq 'Applied' -or ($Interactive -and $due -and !$CheckOnly -and !$Stage -and
+        ![IO.File]::Exists((Join-Path $root 'updater-shortcut.json')))) {
+        Set-UpdaterShortcut $root
+    }
     if ($recover) {
         Write-Status ERROR 'A browser installation was interrupted. Follow the recovery procedure before launching Chromium.'
         return 1

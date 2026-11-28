@@ -26,7 +26,11 @@ function Get-UpdaterCoreFiles {
     }
 }
 
-function Get-UpdaterPackageFiles { Get-UpdaterCoreFiles }
+function Get-UpdaterPackageFiles {
+    $files = Get-UpdaterCoreFiles
+    $files['UpdaterShortcut.ps1'] = 'src/UpdaterShortcut.ps1'
+    $files
+}
 
 function Test-UpdaterPayloadName([string]$Name) {
     $Name -cmatch '\A[A-Za-z][A-Za-z0-9._-]{0,63}\z' -and
