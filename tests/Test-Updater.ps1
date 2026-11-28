@@ -230,7 +230,7 @@ try {
             browserUpdateMode = 'Automatic'; browserTrust = @{ allowUnsigned = $true; signerSha256 = $null } }
         $candidate = @{ Tag = '158.0.8127.36-1.1'; Digest = 'b' * 64; Version = [version]'158.0.8127.36' }
         $record = @{ Installs = 0; GateStatus = 'Pass'; Messages = [Collections.Generic.List[string]]::new() }
-        $fixtureInventory = @(@{ Location = 1; Enabled = $false; Manifest = @{ manifest_version = 2 } })
+        $fixtureInventory = @(@{ Id = 'a' * 32; Location = 1; Enabled = $false; Manifest = @{ manifest_version = 2 } })
         function Write-Status($Level, $Message) { $record.Messages.Add($Message) }
         function Get-BrowserVersion { [version]'157.0.8000.1' }
         function Get-WindowsCandidate { $candidate }
@@ -380,22 +380,188 @@ try {
         Assert-Fails { Get-StoreUpdates @($id) ([version]'158.0.8127.36') } 'Unexpected Web Store artifact'
     }
 
-    Test-Case 'extension update prompts and reports an unexpected permission increase' {
+    Test-Case 'approved channels stage only exact verified bytes and verify actual installed identity' {
         function Assert-ExtensionKey($Id, $Manifest) { }
         $installed = @{ version = '1.0'; manifest_version = 3; permissions = @('storage'); update_url = $script:StoreUrl }
         $remote = @{ version = '1.1'; manifest_version = 3; permissions = @('storage'); update_url = $script:StoreUrl }
-        function Get-VerifiedManifest($Asset, $Id, $Store) { $remote }
-        $extension = @{ Id = 'a' * 32; Manifest = $installed }
-        $asset = @{ Version = '1.1' }
+        [byte[]]$bytes = @(0,1,2,3)
+        $asset = @{ Version = '1.1'; Size = $bytes.Length; Digest = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)) }
+        $fixture = @{ Store = $true; ExpectedId = 'a' * 32 }
+        function Get-VerifiedExtensionPackage($Asset, $Id, $Store) {
+            Assert-Equal $Id $fixture.ExpectedId
+            Assert-Equal $Store $fixture.Store
+            @{ Manifest = $remote; Bytes = $bytes }
+        }
+        $extension = @{ Id = $fixture.ExpectedId; Manifest = $installed; Enabled = $false }
         $version = [version]'158.0.8127.36'
         $update = Test-ExtensionCandidate $extension 'Store' $asset $version $false
-        Assert-Equal $update.Status 'Action'
-        if ($update.Text -notlike '*signature verified*') { throw 'Expected a verified update prompt.' }
+        Assert-Equal $update.Update 'Verified'
+        Assert-Equal (Test-Path -LiteralPath (Join-Path $root 'extension-packages')) $false
         $remote.permissions += 'tabs'
-        $update = Test-ExtensionCandidate $extension 'Store' $asset $version $false
-        if ($update.Text -notlike '*changes requested permissions*') { throw 'Expected a permission warning.' }
+        $update = Test-ExtensionCandidate $extension 'Store' $asset $version $false $root
+        Assert-Equal $update.Update 'Pending'
+        Assert-Equal (Test-ArtifactFile $update.Path $asset) $true
+        if ($update.Text -notlike '*changed permission*disabled*') { throw 'Expected permission and disabled-state notices.' }
+        [IO.File]::WriteAllBytes($update.Path, [byte[]]@(4,3,2,1))
+        $update = Test-ExtensionCandidate $extension 'Store' $asset $version $false $root
+        Assert-Equal (Test-ArtifactFile $update.Path $asset) $true
+        $installed.version = '1.1'
+        Assert-Fails { Test-ExtensionCandidate $extension 'Store' $asset $version $true } 'differ from the signed package'
+        $installed.permissions = $remote.permissions
+        Assert-Equal (Test-ExtensionCandidate $extension 'Store' $asset $version $true).Update 'Installed'
+        Assert-Equal $extension.Enabled $false
+        $diskManifest = Join-Path $root 'extension-manifest.json'
+        $registered = [pscustomobject]@{ Id = $extension.Id; Enabled = $false; Manifest = $installed; ManifestPath = $diskManifest }
+        Write-Json $diskManifest $installed
+        Assert-Equal (Test-ExtensionCandidate $registered 'Store' $asset $version $true).Update 'Installed'
+        Write-Json $diskManifest ($installed + @{ externally_connectable = @{ ids = @('*') } })
+        Assert-Fails { Test-ExtensionCandidate $registered 'Store' $asset $version $true } 'differ from the signed manifest evidence'
+        $installed.version = '1.0'
         $remote.update_url = 'https://example.test/update'
         Assert-Fails { Test-ExtensionCandidate $extension 'Store' $asset $version $false } 'changed its update source'
+        $fixture.Store = $false
+        foreach ($channel in 'WebStoreHelper','Ubo') {
+            $fixture.ExpectedId = if ($channel -ceq 'Ubo') { $script:UboId } else { $script:WebStoreId }
+            $remote.update_url = if ($channel -ceq 'Ubo') { $script:UboUrl } else { $script:WebStoreUrl }
+            if ($channel -ceq 'Ubo') { $remote.manifest_version = 2 }
+            $extension.Id = $fixture.ExpectedId
+            $update = Test-ExtensionCandidate $extension $channel $asset $version $false $root
+            Assert-Equal $update.Update 'Pending'
+            Assert-Equal (Test-ArtifactFile $update.Path $asset) $true
+        }
+    }
+
+    Test-Case 'permission snapshots preserve associations and detect removed restrictions' {
+        $first = @{ matches = @('https://one.test/*','https://other.test/*'); js = @('first.js')
+            include_globs = @('*limited*'); exclude_matches = @('https://one.test/no/*'); exclude_globs = @('*private*') }
+        $second = @{ matches = @('https://two.test/*'); js = @('second.js') }
+        $baseline = @{ content_scripts = @($first,$second); optional_permissions = @('tabs')
+            externally_connectable = @{ ids = @('a' * 32) }; content_security_policy = @{ extension_pages = "script-src 'self'" } }
+        $old = @(Get-ManifestPermissions $baseline)
+        $candidate = $baseline.Clone()
+        $firstNew = $first.Clone()
+        $secondNew = $second.Clone()
+        $candidate.content_scripts = @($secondNew,$firstNew)
+        $firstNew.matches = @('https://other.test/*','https://one.test/*')
+        $firstNew.all_frames = $false
+        Assert-Equal @(Compare-PermissionSnapshots $old (Get-ManifestPermissions $candidate)).Count 0
+        $firstNew.js = $second.js
+        $secondNew.js = $first.js
+        Assert-Equal (Compare-PermissionSnapshots $old (Get-ManifestPermissions $candidate)) 'content_scripts'
+        $firstNew.js = $first.js
+        $secondNew.js = $second.js
+        foreach ($field in 'include_globs','exclude_matches','exclude_globs') {
+            $firstNew.Remove($field)
+            Assert-Equal (Compare-PermissionSnapshots $old (Get-ManifestPermissions $candidate)) 'content_scripts'
+            $firstNew[$field] = $first[$field]
+        }
+        $firstNew.match_origin_as_fallback = $true
+        Assert-Equal (Compare-PermissionSnapshots $old (Get-ManifestPermissions $candidate)) 'content_scripts'
+        $firstNew.Remove('match_origin_as_fallback')
+        foreach ($field in 'externally_connectable','content_security_policy') {
+            $candidate.Remove($field)
+            Assert-Equal (Compare-PermissionSnapshots $old (Get-ManifestPermissions $candidate)) $field
+            $candidate[$field] = $baseline[$field]
+        }
+        $candidate.Remove('optional_permissions')
+        $candidate.permissions = @('tabs')
+        Assert-Equal (Compare-PermissionSnapshots $old (Get-ManifestPermissions $candidate)) 'permissions'
+    }
+
+    Test-Case 'uBlock compatibility follows actual version, identity, package and profile outcome' {
+        $tested = @{ UboVersion = '1.2.0'; UboDigest = 'a' * 64 }
+        $bytes = [byte[]]@(1)
+        $asset = @{ Version = $tested.UboVersion; Digest = $tested.UboDigest; Size = $bytes.Length }
+        $manifest = @{ version = $asset.Version; manifest_version = 2; update_url = $script:UboUrl }
+        $pending = $manifest.Clone()
+        $pending.version = '1.1.0'
+        $failed = $manifest.Clone()
+        $failed.permissions = @('tabs')
+        $legacy = $manifest.Clone()
+        $legacy.update_url = $script:StoreUrl
+        function Assert-ExtensionKey { }
+        function Get-StoreUpdates { @{} }
+        function Get-ExtensionRelease { $asset }
+        function Get-VerifiedExtensionPackage { @{ Manifest = $manifest; Bytes = $bytes } }
+        function Save-VerifiedExtensionPackage { 'fixture.crx' }
+        $messages = [Collections.Generic.List[string]]::new()
+        function Write-Status($Level, $Message) { $messages.Add($Message) }
+        $inventory = @(
+            @{ Profile = 'Match'; Id = $script:UboId; Enabled = $false; Location = 1; Manifest = $manifest }
+            @{ Profile = 'Pending'; Id = $script:UboId; Enabled = $true; Location = 1; Manifest = $pending }
+            @{ Profile = 'Failed'; Id = $script:UboId; Enabled = $true; Location = 1; Manifest = $failed }
+            @{ Profile = 'Legacy'; Id = $script:OldUboId; Enabled = $true; Location = 1; Manifest = $legacy }
+        )
+        $outcome = Invoke-ExtensionChecks $inventory @{ extensions = @{} } ([version]'158.0.8127.36') @{} $false $root $tested
+        Assert-Equal $outcome.Inventory["Match/$script:UboId"].Update 'Installed'
+        Assert-Equal $outcome.Inventory["Match/$script:UboId"].Enabled $false
+        Assert-Equal $outcome.Inventory["Pending/$script:UboId"].Version '1.1.0'
+        Assert-Equal $outcome.Inventory["Pending/$script:UboId"].Update 'Pending'
+        Assert-Equal $outcome.Inventory["Failed/$script:UboId"].Update 'Failed'
+        Assert-Equal @($messages -like '*match the tested Chromium*').Count 1
+        Assert-Equal @($messages -like '*installed combination is unverified*').Count 3
+        $messages.Clear()
+        $tested.UboDigest = 'b' * 64
+        [void](Invoke-ExtensionChecks @($inventory[0]) @{ extensions = @{} } ([version]'158.0.8127.36') $outcome.Inventory $false $root $tested)
+        Assert-Equal @($messages -like '*match the tested Chromium*').Count 0
+        Assert-Equal @($messages -like '*is no longer registered*').Count 3
+    }
+
+    Test-Case 'browser installation refreshes inventory and next standard handoff reconciles startup changes' {
+        $isolated = Join-Path $root 'reconcile'
+        [void](New-PrivateRoot $isolated)
+        $profileRoot = Join-Path $isolated 'profiles'
+        $firstProfile = Join-Path $profileRoot 'Default'
+        $startupProfile = Join-Path $profileRoot 'Profile 1'
+        [void][IO.Directory]::CreateDirectory($firstProfile)
+        $initial = 'a' * 32
+        $afterInstall = 'b' * 32
+        $afterLaunch = 'c' * 32
+        function Write-ComponentRegistration([string]$ProfilePath, [string]$Id) {
+            Write-Json (Join-Path $ProfilePath 'Preferences') @{ extensions = @{ settings = @{
+                $Id = @{ location = 5; manifest = @{ version = '1.0'; manifest_version = 3 } }
+            } } }
+        }
+        Write-ComponentRegistration $firstProfile $initial
+        $fixture = @{ Checks = 0; Launches = 0 }
+        $fixtureConfig = @{ browserPath = 'fixture'; userData = $profileRoot; architecture = 'x64'; browserArgs = @(); extensions = @{} }
+        $version = [version]'158.0.8127.36'
+        function Read-Config { $fixtureConfig }
+        function Get-BrowserVersion { $version }
+        function Get-WindowsCandidate { @{ Tag = "$version-1"; Version = $version } }
+        function Get-UpstreamStable { $version }
+        function Get-StoreUpdates { @{} }
+        function Invoke-BrowserUpdate {
+            $fixture.Checks++
+            if ($fixture.Checks -eq 1) {
+                Write-ComponentRegistration $firstProfile $afterInstall
+                return @{ Status = 'Complete'; Version = $version; Applied = $true }
+            }
+            @{ Status = 'Complete'; Version = $version }
+        }
+        function Start-Chromium {
+            $fixture.Launches++
+            if ($fixture.Launches -eq 1) {
+                [void][IO.Directory]::CreateDirectory($startupProfile)
+                Write-ComponentRegistration $startupProfile $afterLaunch
+            }
+        }
+        $stateFile = Join-Path $isolated 'state.json'
+        $NoLaunch = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        $state = Read-DailyState $stateFile
+        Assert-Equal $state.InventoryRefresh 'AwaitingLaunch'
+        Assert-Equal $state.Inventory.Contains("Default/$initial") $false
+        Assert-Equal $state.Inventory.Contains("Default/$afterInstall") $true
+        $NoLaunch = $false
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        Assert-Equal (Read-DailyState $stateFile).InventoryRefresh 'Pending'
+        Assert-Equal $fixture.Checks 1
+        Assert-Equal (Invoke-UpdateSession $isolated) 0
+        $state = Read-DailyState $stateFile
+        Assert-Equal $state.InventoryRefresh $null
+        Assert-Equal $state.Inventory.Contains("Profile 1/$afterLaunch") $true
+        Assert-Equal $fixture.Checks 2
     }
 
     Test-Case 'CRX3 cryptography rejects a modified package, unpinned ID and absent Store proof' {
@@ -524,12 +690,15 @@ public static class InstallerFixture {
         Assert-Equal ([IO.File]::ReadAllText($dll)) 'before'
         Assert-Equal ([IO.File]::Exists($pending)) $false
         $busy.At = 0
-        Assert-Equal (Install-BrowserCandidate $root $config $version $candidate $artifact $files) 'Installed'
+        $compatibility = @{ UboVersion = '1.77.4'; UboDigest = 'a' * 64 }
+        Assert-Equal (Install-BrowserCandidate $root $config $version $candidate $artifact $files $compatibility) 'Installed'
         Assert-Equal ([IO.File]::Exists($pending)) $false
         Assert-Equal (Read-Json $stateFile).Tag $candidate.Tag
         Assert-Equal (Get-BrowserReleaseStatus $root $config $version $candidate) 'Current'
+        Assert-Equal (Get-InstalledMv2Evidence $root $config $version).UboDigest $compatibility.UboDigest
 
         [IO.File]::WriteAllText($dll, 'before')
+        Assert-Equal (Get-InstalledMv2Evidence $root $config $version) $null
         Write-Json $stateFile $previousRelease
         $config.userData = $root
         $config.browserArgs = @()

@@ -92,10 +92,31 @@ function Get-InstalledBrowserIdentity($Config, [version]$Version, $ExpectedFiles
     [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($contents -join "`n")))
 }
 
-function Write-BrowserRelease([string]$Root, $Candidate, [string]$Identity) {
-    Write-Json (Join-Path $Root 'browser-release.json') @{
+function Write-BrowserRelease([string]$Root, $Candidate, [string]$Identity, $Compatibility) {
+    $record = @{
         Tag = $Candidate.Tag; Digest = $Candidate.Digest; Architecture = $Candidate.Architecture
         Identity = $Identity
+    }
+    if ($Compatibility) { $record.Mv2 = $Compatibility }
+    Write-Json (Join-Path $Root 'browser-release.json') $record
+}
+
+function Get-InstalledMv2Evidence([string]$Root, $Config, [version]$Version) {
+    try {
+        $path = Join-Path $Root 'browser-release.json'
+        Assert-LocalPath $path
+        if (![IO.File]::Exists($path)) { return }
+        $record = Read-Json $path
+        if ($record['Mv2'] -and $record.Mv2.UboVersion -cmatch '^\d+\.\d+\.\d+$' -and
+            $record.Mv2.UboDigest -cmatch '^[a-fA-F0-9]{64}$' -and $record.Architecture -ceq $Config.architecture -and
+            (Convert-WindowsTag $record.Tag).Version -eq $Version -and
+            $record.Digest -cmatch '^[a-fA-F0-9]{64}$' -and
+            $record.Identity -cmatch '^[a-fA-F0-9]{64}$' -and
+            $record.Identity -ceq (Get-InstalledBrowserIdentity $Config $Version)) {
+            return $record.Mv2
+        }
+    } catch {
+        Write-Status WARN 'The installed browser compatibility record is unavailable for extension reconciliation.'
     }
 }
 
@@ -238,7 +259,7 @@ function Assert-RegisteredInstall($Config, [version]$Version) {
     Assert-LocalPath $setup
 }
 
-function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $Candidate, $Artifact, $Payload) {
+function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $Candidate, $Artifact, $Payload, $Compatibility) {
     Assert-BrowserTrust $Config.browserTrust $Artifact
     if (Test-BrowserBusy $Config) { return 'Deferred' }
     Assert-RegisteredInstall $Config $Installed
@@ -284,7 +305,7 @@ function Install-BrowserCandidate([string]$Root, $Config, [version]$Installed, $
     if ($Payload -and !(Test-BrowserPayload ([IO.Path]::GetDirectoryName($Config.browserPath)) $Payload)) {
         throw 'The installed browser files do not match the verified installer payload.'
     }
-    Write-BrowserRelease $Root $Candidate (Get-InstalledBrowserIdentity $Config $Candidate.Version)
+    Write-BrowserRelease $Root $Candidate (Get-InstalledBrowserIdentity $Config $Candidate.Version) $Compatibility
     [IO.File]::Delete($pending)
     [IO.File]::Delete($installPreferences)
     try { Remove-ExpiredBackups $Root $backup } catch { Write-Status WARN 'Backup retention needs manual attention.' }

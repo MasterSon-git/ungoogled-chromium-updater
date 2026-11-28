@@ -42,6 +42,8 @@ Keep a current, trusted installation of [official 7-Zip](https://www.7-zip.org/d
 
 `Update.ps1 -Stage -TestCompatibility` runs the full test on demand. The isolated browser uses unpacked contents from the latest verified stable signed full uBlock Origin package. The test checks background initialization and actual request blocking with an allowed control. The result names the tested version and warns when an installed full uBlock Origin version differs. Other installed MV2 extensions are outside the test. For a production update, when the payload has been extracted, installed files must also match it before the recovery marker is cleared, even if the installer reports success.
 
+After a successful gated browser installation, the launcher records the full uBlock Origin version and CRX hash that passed against the installed browser record. It rereads the profiles and stages the verified extension update where needed. It reports a matching installed combination only when the observed extension ID, version and signed manifest evidence match that result. A disabled copy stays disabled. A legacy ID, older version or unverifiable copy remains explicitly unverified. A pending extension action does not block an otherwise eligible security update after the gate passes. If the channel advances after a gate run, the launcher checks its current release without retrieving historical packages. [Extension installation procedure](extensions.md#install-a-verified-update)
+
 - **Pass** allows an otherwise eligible release. The result applies to the exact installer and signed uBlock Origin artifacts and the current test version.
 - **Incompatible** means the MV2 background or filtering did not work during the test.
 - **Inconclusive** means a supported payload could not be established or the test could not establish an MV2 result.
@@ -64,12 +66,13 @@ All paths below are under `%LOCALAPPDATA%\UngoogledChromiumUpdater`.
 | `updater-previous-app` | Previous launcher and entry scripts retained after a swap |
 | `config.json` | Private browser and extension source configuration |
 | `config.legacy.json` | Original private configuration retained during migration |
-| `state.json` | Daily browser and extension status, separate updater outcome, and extension baselines |
-| `browser-release.json` | Last verified Windows release tag, installer digest, architecture and installed application fingerprint |
+| `state.json` | Daily check status, separate updater outcome, per-profile extension observations and permission baselines, and pending startup reconciliation |
+| `browser-release.json` | Last verified Windows release tag, installer digest, architecture, installed application fingerprint and applicable full uBlock Origin test evidence |
 | `mv2-pass.json` | Latest successful compatibility result and associated artifact identities and file hashes |
 | `mv2-work` | Single temporary extraction and profile directory, retained if cleanup needs attention |
 | `logs` | Daily local logs, rotated at 512 KiB and retained for up to 30 days after a later check |
 | `downloads` | Most recent staged Windows installer, reverified before use |
+| `extension-packages` | Private cache of verified signed CRX candidates awaiting native installation |
 | `backups` | Two verified browser and profile copies after successful installation |
 | `installation.json` | Recovery marker written immediately before starting the installer |
 | `shortcut-backups` | Original Desktop and Start Menu shortcuts |
