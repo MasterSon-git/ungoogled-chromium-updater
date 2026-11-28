@@ -2,6 +2,7 @@
 [CmdletBinding()]
 param(
     [switch]$Force, [switch]$CheckOnly, [switch]$Stage, [switch]$Apply, [switch]$NoLaunch,
+    [switch]$RetryExtensionUpdates,
     [switch]$VerifyCurrent, [switch]$TestCompatibility, [switch]$Dispatch, [switch]$Interactive, [switch]$Probe,
     [ValidateSet('Applied','Failed')][string]$SelfUpdateOutcome,
     [string]$Payload,
@@ -20,6 +21,10 @@ function Invoke-Launcher {
     }
     if ((@($CheckOnly,$Stage,$Apply) -eq $true).Count -gt 1 -or ($TestCompatibility -and !$Stage)) {
         throw 'Choose one of check-only, stage or apply. Compatibility testing requires -Stage.'
+    }
+    if ($RetryExtensionUpdates -and ($CheckOnly -or $Stage -or $NoLaunch)) {
+        Write-Host '[ERROR] Retrying extension prompts requires a normal browser launch.'
+        return 1
     }
     $root = if ([IO.Path]::GetFileName($PSScriptRoot) -ieq 'app') {
         [IO.Path]::GetDirectoryName($PSScriptRoot)
@@ -63,6 +68,7 @@ catch {
 }
 if ($Interactive) {
     if ($code -eq 20) { exit $code }
+    if ($code -eq 21) { exit 2 }
     if ($code) { [void](Read-Host 'Press Enter to close this window') }
     else { Start-Sleep -Milliseconds 1500 }
 }

@@ -326,3 +326,110 @@ function Start-Chromium($Config, [string[]]$BrowserArguments) {
     foreach ($argument in @($Config.browserArgs) + $BrowserArguments) { [void]$start.ArgumentList.Add($argument) }
     [Diagnostics.Process]::Start($start).Dispose()
 }
+
+function Get-ChromiumSwitches([string[]]$Arguments) {
+    $switches = @{}
+    foreach ($argument in $Arguments) {
+        if ($argument -ceq '--') { break }
+        if ($argument -match '^(?:--?|/)([^=]+)(?:=(.*))?$') {
+            $switches[$Matches[1]] = $Matches[2]
+        }
+    }
+    $switches
+}
+
+function Test-RegularChromiumLaunch($Switches) {
+    foreach ($name in 'incognito','guest','headless','app','app-id','kiosk','no-startup-window',
+        'disable-extensions','disable-extensions-except','pack-extension','validate-crx') {
+        if ($Switches.ContainsKey($name)) { return $false }
+    }
+    $true
+}
+
+function Test-ChromiumExtensionPrompt([string]$UserData, $Switches) {
+    $saved = @()
+    if (!$Switches.ContainsKey('no-experiments')) {
+        try {
+            $path = Join-Path $UserData 'Local State'
+            Assert-LocalPath $path
+            $data = Read-Json $path
+            if ($data['browser']) {
+                $saved = @(@($data['browser']['enabled_labs_experiments']) -clike 'extension-mime-request-handling@*')
+            }
+        } catch { return $false }
+    }
+    if (@($saved -cne 'extension-mime-request-handling@2').Count) { return $false }
+    if ($Switches.ContainsKey('extension-mime-request-handling')) {
+        return $Switches['extension-mime-request-handling'] -ceq 'always-prompt-for-install'
+    }
+    'extension-mime-request-handling@2' -cin $saved
+}
+
+function Find-ReadyChromium($Config, [int]$TimeoutMilliseconds = 6000) {
+    if (!('ChromiumHandoffWindow' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class ChromiumHandoffWindow
+{
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string windowClass, string title);
+
+    [DllImport("user32.dll", ExactSpelling = true)]
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out int processId);
+
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+    private static extern IntPtr CommandLineToArgvW(string commandLine, out int count);
+
+    [DllImport("kernel32.dll", ExactSpelling = true)]
+    private static extern IntPtr LocalFree(IntPtr memory);
+
+    public static int FindOwner(string userData)
+    {
+        IntPtr window = FindWindowExW(new IntPtr(-3), IntPtr.Zero, "Chrome_MessageWindow", userData);
+        int owner = 0;
+        if (window != IntPtr.Zero) GetWindowThreadProcessId(window, out owner);
+        return owner;
+    }
+
+    public static string[] ReadArguments(string commandLine)
+    {
+        int count;
+        IntPtr argv = CommandLineToArgvW(commandLine, out count);
+        if (argv == IntPtr.Zero) throw new InvalidOperationException("Cannot read Chromium launch arguments.");
+        try
+        {
+            var arguments = new string[Math.Max(0, count - 1)];
+            for (int i = 1; i < count; i++)
+                arguments[i - 1] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size));
+            return arguments;
+        }
+        finally { LocalFree(argv); }
+    }
+}
+'@
+    }
+    $userData = [IO.Path]::TrimEndingDirectorySeparator($Config.userData)
+    $timer = [Diagnostics.Stopwatch]::StartNew()
+    do {
+        $owner = [ChromiumHandoffWindow]::FindOwner($userData)
+        if ($owner) {
+            $process = Get-Process -Id $owner -ErrorAction SilentlyContinue
+            if ($process) {
+                try {
+                    if ($process.Path -ieq $Config.browserPath -and $process.MainWindowHandle -ne [IntPtr]::Zero -and
+                        $process.Responding) { return $owner }
+                } finally { $process.Dispose() }
+            }
+        }
+        if ($timer.ElapsedMilliseconds -lt $TimeoutMilliseconds) { Start-Sleep -Milliseconds 125 }
+    } while ($timer.ElapsedMilliseconds -lt $TimeoutMilliseconds)
+}
+
+function Get-RunningChromiumSwitches($Config, [int]$Owner) {
+    $running = Get-CimInstance Win32_Process -Filter "ProcessId=$Owner" -OperationTimeoutSec 5
+    if ($running -and $running.ExecutablePath -ieq $Config.browserPath -and $running.CommandLine) {
+        Get-ChromiumSwitches ([ChromiumHandoffWindow]::ReadArguments($running.CommandLine))
+    }
+}

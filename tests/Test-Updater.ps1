@@ -507,6 +507,128 @@ try {
         Assert-Equal @($messages -like '*is no longer registered*').Count 3
     }
 
+    Test-Case 'CRX prompt configuration detects saved and active switches without editing Chromium' {
+        $data = Join-Path $root 'prompt-config'
+        [void][IO.Directory]::CreateDirectory($data)
+        $path = Join-Path $data 'Local State'
+        $prompt = '--extension-mime-request-handling=always-prompt-for-install'
+        Write-Json $path @{ browser = @{ enabled_labs_experiments = @('unrelated@1','extension-mime-request-handling@2') } }
+        $original = Get-FileHash -LiteralPath $path
+        Assert-Equal (Test-ChromiumExtensionPrompt $data @{}) $true
+        Assert-Equal (Test-ChromiumExtensionPrompt $data (Get-ChromiumSwitches @('--no-experiments'))) $false
+        Assert-Equal (Test-ChromiumExtensionPrompt $data (Get-ChromiumSwitches @('--no-experiments',$prompt))) $true
+        Assert-Equal (Test-ChromiumExtensionPrompt $data (Get-ChromiumSwitches @('--extension-mime-request-handling=download-as-regular-file'))) $false
+        Assert-Equal (Get-FileHash -LiteralPath $path).Hash $original.Hash
+        Write-Json $path @{ browser = @{ enabled_labs_experiments = @('extension-mime-request-handling@1') } }
+        Assert-Equal (Test-ChromiumExtensionPrompt $data (Get-ChromiumSwitches @($prompt))) $false
+        Write-Json $path @{ browser = @{} }
+        Assert-Equal (Test-ChromiumExtensionPrompt $data @{}) $false
+        Assert-Equal (Test-ChromiumExtensionPrompt $data (Get-ChromiumSwitches @($prompt))) $true
+        Assert-Equal (Test-RegularChromiumLaunch (Get-ChromiumSwitches @('/INCOGNITO'))) $false
+        Assert-Equal (Test-RegularChromiumLaunch (Get-ChromiumSwitches @('--','--guest'))) $true
+    }
+
+    Test-Case 'native CRX requests batch per profile and suppress identical pending requests' {
+        $data = Join-Path $root 'handoff-data'
+        [void][IO.Directory]::CreateDirectory($data)
+        $statePath = Join-Path $root 'handoff-state.json'
+        $exe = Join-Path $root 'chrome.exe'
+        $fixture = @{ Prompt = $true; Owner = 42; Calls = [Collections.Generic.List[object]]::new() }
+        $fixtureConfig = @{ userData = $data; browserPath = $exe; browserArgs = @("--user-data-dir=$data"); extensions = @{} }
+        $versions = @{ version = '1.1'; manifest_version = 2; update_url = $script:UboUrl }
+        $helperManifest = @{ version = '1.1'; manifest_version = 3; update_url = $script:WebStoreUrl }
+        $inventory = @(
+            @{ Profile = 'Default'; Id = $script:UboId; Location = 1; Enabled = $false; Manifest = $versions }
+            @{ Profile = 'Default'; Id = $script:WebStoreId; Location = 1; Enabled = $true; Manifest = $helperManifest }
+            @{ Profile = 'Profile 1'; Id = $script:UboId; Location = 1; Enabled = $true; Manifest = $versions.Clone() }
+        )
+        $state = @{ Inventory = @{} }
+        $i = 0
+        $candidates = @(foreach ($entry in $inventory) {
+            $key = "$($entry.Profile)/$($entry.Id)"
+            $state.Inventory[$key] = @{ Version = '1.1'; Enabled = $entry.Enabled; Update = 'Pending' }
+            $package = Join-Path $root "package-$i.crx"
+            [IO.File]::WriteAllBytes($package, [byte[]]@($i++))
+            @{ Key = $key; Profile = $entry.Profile; Channel = Get-ExtensionChannel $entry @{}; Version = '1.1'
+                Path = $package; Asset = @{ Version = '1.2'; Size = 1; Digest = (Get-FileHash -LiteralPath $package).Hash } }
+        })
+        function Find-ReadyChromium { $fixture.Owner }
+        function Get-RunningChromiumSwitches { @{} }
+        function Test-ChromiumExtensionPrompt { $fixture.Prompt }
+        function Get-ExtensionInventory { $inventory }
+        function Assert-ExtensionKey { }
+        function Start-Chromium($Config, $Arguments) {
+            Assert-Equal $Config.browserPath $exe
+            Assert-Equal $Config.browserArgs.Count 0
+            $saved = Read-Json $statePath
+            foreach ($c in ($candidates | Where-Object Path -cin $Arguments)) {
+                Assert-Equal $saved.Inventory[$c.Key].HandoffDigest $c.Asset.Digest
+            }
+            $fixture.Calls.Add($Arguments)
+        }
+        $fixture.Prompt = $false
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $false) $false
+        Assert-Equal $fixture.Calls.Count 0
+        $fixture.Prompt = $true
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @('--user-data-dir=C:\other') $candidates $state $statePath $false) $false
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @('--incognito') $candidates $state $statePath $false) $false
+        $fixture.Owner = 0
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $false) $false
+        $fixture.Owner = 42
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $false) $true
+        Assert-Equal $fixture.Calls.Count 2
+        Assert-Equal $fixture.Calls[0].Count 4
+        Assert-Equal $fixture.Calls[0][1] '--profile-directory=Default'
+        Assert-Equal $fixture.Calls[1][1] '--profile-directory=Profile 1'
+        Assert-Equal $fixture.Calls[1][2] $candidates[2].Path
+        Assert-Equal $state.Inventory[$candidates[0].Key].Enabled $false
+        Assert-Equal $state.Inventory[$candidates[0].Key].Update 'Pending'
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $false) $true
+        Assert-Equal $fixture.Calls.Count 2
+        # A registered version change and a corrupt CRX both block a handoff.
+        [IO.File]::WriteAllBytes($candidates[1].Path, [byte[]]@(10))
+        $inventory[2].Manifest.version = '1.2'
+        Assert-Equal (Invoke-ExtensionHandoffs $fixtureConfig @() $candidates $state $statePath $true) $false
+        Assert-Equal $fixture.Calls.Count 3
+        Assert-Equal $fixture.Calls[2].Count 3
+        Assert-Equal $fixture.Calls[2][2] $candidates[0].Path
+    }
+
+    Test-Case 'normal browser invocation keeps its arguments and precedes extension handoff' {
+        $isolated = Join-Path $root 'launch-handoff'
+        [void][IO.Directory]::CreateDirectory($isolated)
+        $fixtureConfig = @{ browserArgs = @('--new-window'); selfUpdateEnabled = $false }
+        $events = [Collections.Generic.List[string]]::new()
+        function Read-Config { $fixtureConfig }
+        function Set-UpdaterShortcut { }
+        function Invoke-Workflow {
+            @{ Status = 'Action'; Inventory = @{}; Candidates = @(@{ Path = 'verified.crx' }); NativeActionOnly = $true }
+        }
+        function Start-Chromium($Config, $Arguments) {
+            Assert-Equal $Config.browserArgs[0] '--new-window'
+            Assert-Equal $Arguments.Count 2
+            Assert-Equal $Arguments[0] 'relative path.html'
+            Assert-Equal $Arguments[1] 'https://example.test/?a=1&b=2'
+            $events.Add('browser')
+        }
+        function Invoke-ExtensionHandoffs { $events.Add('extensions'); $true }
+        $Force = $true
+        $Interactive = $true
+        $BrowserArguments = @('relative path.html','https://example.test/?a=1&b=2')
+        Assert-Equal (Invoke-UpdateSession $isolated) 21
+        Assert-Equal ($events -join ',') 'browser,extensions'
+        $events.Clear()
+        $NoLaunch = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 2
+        $NoLaunch = $false
+        $CheckOnly = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 2
+        $CheckOnly = $false
+        $Stage = $true
+        Assert-Equal (Invoke-UpdateSession $isolated) 2
+        Assert-Equal $events.Count 0
+    }
+
     Test-Case 'browser installation refreshes inventory and next standard handoff reconciles startup changes' {
         $isolated = Join-Path $root 'reconcile'
         [void](New-PrivateRoot $isolated)
@@ -733,7 +855,7 @@ public static class InstallerFixture {
         [IO.File]::Delete($stateFile)
     }
 
-    Test-Case 'launch arguments preserve URL, quotes, empty strings and Unicode' {
+    Test-Case 'launch preserves the working directory, URLs, quotes, empty arguments and Unicode' {
         $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
         if (!(Test-Path -LiteralPath $compiler)) {
             $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
@@ -748,7 +870,7 @@ internal static class Recorder {
         using (var writer = new StreamWriter(args[0], false, new UTF8Encoding(false))) {
             for (int i = 1; i < args.Length; ++i) writer.WriteLine(Convert.ToBase64String(Encoding.UTF8.GetBytes(args[i])));
         }
-        File.WriteAllText(args[0] + ".done", "");
+        File.WriteAllText(args[0] + ".done", Directory.GetCurrentDirectory());
     }
 }
 '@)
@@ -757,8 +879,13 @@ internal static class Recorder {
         if ($LASTEXITCODE -ne 0) { throw 'Cannot compile argv fixture.' }
         $output = Join-Path $root 'args.txt'
         $argsToCheck = @('--single-argument','https://example.test/?a=1&b=2','quote"inside','dir with space\','', "utf-$([char]0x00e9)")
-        Start-Chromium @{ browserPath = $recorder; browserArgs = @($output) } $argsToCheck
+        $originalDirectory = [Environment]::CurrentDirectory
+        try {
+            [Environment]::CurrentDirectory = $root
+            Start-Chromium @{ browserPath = $recorder; browserArgs = @($output) } $argsToCheck
+        } finally { [Environment]::CurrentDirectory = $originalDirectory }
         for ($i = 0; $i -lt 30 -and !(Test-Path -LiteralPath "$output.done"); $i++) { Start-Sleep -Milliseconds 100 }
+        Assert-Equal ([IO.File]::ReadAllText("$output.done")) $root
         $recorded = [IO.File]::ReadAllLines($output)
         Assert-Equal $recorded.Count $argsToCheck.Count
         for ($i = 0; $i -lt $recorded.Count; $i++) {
